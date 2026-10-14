@@ -1,4 +1,9 @@
-"""验证 120fps：选中 120 档 -> 录制 -> 用 fps_probe 读真实帧率"""
+"""验证帧率档位：选中指定档 -> 录制 -> 用 fps_probe 读真实帧率
+
+用法：fps_test.py [下拉索引] [录制秒数]
+默认索引 6（=120 fps）。档位表见 main.cpp 的 kFpsVals：
+0=10 1=15 2=20 3=24 4=30 5=60 6=120
+"""
 import ctypes, ctypes.wintypes as wt, os, subprocess, sys, time
 
 u32 = ctypes.windll.user32
@@ -46,14 +51,17 @@ def main():
     if not h:
         print("FAIL 未找到主窗口"); return 1
 
+    idx = int(sys.argv[1]) if len(sys.argv) > 1 else 6
+    secs = float(sys.argv[2]) if len(sys.argv) > 2 else 5.0
+
     before = newest_mp4()
-    n = set_fps(h, 6)     # 索引 6 = 120 fps
-    print("帧率下拉项数 =", n, "(应为 7)")
+    n = set_fps(h, idx)
+    print("帧率下拉项数 =", n, "(应为 7)，选中索引 =", idx)
     time.sleep(0.5)
 
-    print("开始录制…")
+    print("开始录制 %gs…" % secs)
     rec_click(h)
-    time.sleep(5.0)
+    time.sleep(secs)
     rec_click(h)
     time.sleep(4.0)
 

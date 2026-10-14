@@ -38,8 +38,9 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 - SinkWriter 收到重复 PTS 会直接返回 `EINVAL`，加了单调递增保护
 - Windows 默认调度精度约 15.6 ms，不足以支撑 60/120fps 的帧间隔。
   录制线程调用 `timeBeginPeriod(1)` 并把优先级提到 `ABOVE_NORMAL`，
-  实测 120 fps 可达 **119.62 fps**
-- 高帧率码率按 `sqrt(30 / fps)` 衰减，避免 120fps 码率相对 30fps 线性膨胀 4 倍
+  实测 120 fps 可达 **119.77 fps**
+- 高帧率码率按 `sqrt(30 / fps)` 衰减，避免 120fps 码率相对 30fps 线性膨胀 4 倍。
+  同一段画面实测 30fps 2.42 Mbps → 120fps 4.53 Mbps，仅涨 1.87 倍
 - MFPlay 的 `GetDuration` 对部分文件返回 `0xC00D36D5`，改用 Source Reader
   读取容器 `MF_PD_DURATION`，进度条与总时长才准确
 - 嵌入 comctl32 v6 manifest。缺它时控件退回经典外观，且 `CB_SETMINVISIBLE`
