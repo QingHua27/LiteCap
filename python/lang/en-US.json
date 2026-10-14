@@ -1,0 +1,33 @@
+{
+  "_name": "English",
+  "_code": "en-US",
+
+  "app_subtitle": "Minimal offline screen recorder",
+  "target": "Capture area",
+  "target_all": "All screens",
+  "target_monitor": "Monitor {n}  ({w}×{h})",
+  "target_region_custom": "Custom region",
+  "pick_region": "Select…",
+  "fps": "Frame rate",
+  "quality": "Quality",
+  "quality_high": "High (large file)",
+  "quality_medium": "Medium",
+  "quality_low": "Low (small file)",
+  "language": "Language",
+  "output_dir": "Save to",
+  "browse": "Browse…",
+
+  "start": "● Start recording",
+  "stop": "■ Stop recording",
+  "float_mode": "Float bar",
+  "bar_start": "Record",
+  "bar_stop": "Stop",
+  "bar_back": "Back to main window",
+  "finalizing": "Finishing and writing the file…",
+  "ready": "Ready. Press \"Start recording\".",
+  "region_set": "Custom region set: {w} × {h} px",
+  "recording": "Recording {time}  ·  {frames} frames written",
+  "saved": "Saved {name} ({size}, {time})",
+  "failed": "Recording failed: {msg}",
+  "err_dir": "Cannot create output directory: "
+}

@@ -1,0 +1,33 @@
+{
+  "_name": "简体中文",
+  "_code": "zh-CN",
+
+  "app_subtitle": "极简离线录屏",
+  "target": "录制区域",
+  "target_all": "全部屏幕",
+  "target_monitor": "显示器 {n}  ({w}×{h})",
+  "target_region_custom": "自定义区域",
+  "pick_region": "框选…",
+  "fps": "帧率",
+  "quality": "画质",
+  "quality_high": "高（体积大）",
+  "quality_medium": "中",
+  "quality_low": "低（体积小）",
+  "language": "界面语言",
+  "output_dir": "保存到",
+  "browse": "浏览…",
+
+  "start": "● 开始录制",
+  "stop": "■ 停止录制",
+  "float_mode": "悬浮窗",
+  "bar_start": "录制",
+  "bar_stop": "停止",
+  "bar_back": "回到主窗口",
+  "finalizing": "正在结束并写入文件…",
+  "ready": "就绪。点击“开始录制”即可。",
+  "region_set": "已设定自定义区域：{w} × {h} 像素",
+  "recording": "录制中 {time}  ·  已写入 {frames} 帧",
+  "saved": "已保存 {name}（{size}，时长 {time}）",
+  "failed": "录制失败：{msg}",
+  "err_dir": "无法创建输出目录："
+}

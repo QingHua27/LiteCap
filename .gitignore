@@ -1,0 +1,36 @@
+# ---------- 编译产物 ----------
+LiteCap.exe
+build/
+*.obj
+*.res
+*.pdb
+*.ilk
+*.exp
+*.lib
+LiteCap.exe.manifest
+
+# ---------- 运行期生成 ----------
+settings.ini
+history.tsv
+
+# ---------- 探针 / 测试产物 ----------
+_probe/*.exe
+_probe/*.obj
+_probe/*.mp4
+_test/*.png
+_test/*.log
+
+# ---------- Python 版 ----------
+__pycache__/
+*.py[cod]
+python/dist/
+python/build/
+python/settings.json
+*.spec.bak
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
