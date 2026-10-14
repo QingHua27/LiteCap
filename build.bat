@@ -1,39 +1,102 @@
 @echo off
 REM ============================================================
-REM  LiteCap C++ ç‰ˆæ„å»ºè„šæœ¬
-REM  ä¾èµ–ï¼šVisual Studio 2022/2026 ç”Ÿæˆå·¥å…·ï¼ˆå« C++ æ¡Œé¢å¼€å‘ï¼‰
-REM  ç”¨æ³•ï¼šåœ¨ã€Œx64 Native Tools Command Promptã€é‡Œè¿è¡Œ build.bat
-REM        æˆ–åœ¨æ™®é€š cmd é‡Œè¿è¡Œï¼ˆè„šæœ¬ä¼šè‡ªåŠ¨æ‰¾ vcvars64.batï¼‰
+REM  LiteCap C++ °æ¹¹½¨½Å±¾
+REM  ÒÀÀµ£ºVisual Studio µÄ¡¸Ê¹ÓÃ C++ µÄ×ÀÃæ¿ª·¢¡¹¹¤×÷¸ºÔØ
+REM  ÓÃ·¨£ºÖ±½ÓË«»÷ÔËĞĞ£¬»òÔÚÈÎÒâÃüÁîĞĞÀïÖ´ĞĞ build.bat
 REM ============================================================
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
 if not exist build mkdir build
 
-REM ---- è‹¥å°šæœªè¿›å…¥ VS ç¯å¢ƒï¼Œè‡ªåŠ¨è°ƒç”¨ vcvars64.bat ----
+REM ---- 1) ×¼±¸ VC ±àÒë»·¾³ ----
 where cl.exe >nul 2>nul
-if errorlevel 1 (
-    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
-    if not exist "!VSWHERE!" (
-        echo [x] æ‰¾ä¸åˆ° vswhere.exeï¼Œè¯·æ”¹ç”¨ "x64 Native Tools Command Prompt" è¿è¡Œæœ¬è„šæœ¬ã€‚
-        exit /b 1
-    )
-    for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
-    if not defined VSPATH (
-        echo [x] æœªæ£€æµ‹åˆ°å·²å®‰è£…çš„ Visual C++ ç”Ÿæˆå·¥å…·ã€‚
-        exit /b 1
-    )
-    call "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" >nul
+if not errorlevel 1 goto :have_env
+
+set "VCVARS="
+
+REM 1a) ÏÈÉ¨³£¼û°²×°Â·¾¶¡£
+REM     VS µÄ Insiders / Preview °æ³£³£Ã»ÓĞ×¢²áµ½ vswhere£¬¹Ù·½½Ó¿Ú²é²»µ½£¬
+REM     ËùÒÔÕâÀï²»ÄÜÖ»ÒÀÀµ vswhere¡£
+for %%d in (
+    "%ProgramFiles%\Microsoft Visual Studio\18\Insiders"
+    "%ProgramFiles%\Microsoft Visual Studio\18\Preview"
+    "%ProgramFiles%\Microsoft Visual Studio\2022\Enterprise"
+    "%ProgramFiles%\Microsoft Visual Studio\2022\Professional"
+    "%ProgramFiles%\Microsoft Visual Studio\2022\Community"
+    "%ProgramFiles%\Microsoft Visual Studio\2022\BuildTools"
+    "%ProgramFiles%\Microsoft Visual Studio\2022\Preview"
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Enterprise"
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Professional"
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\Community"
+    "%ProgramFiles(x86)%\Microsoft Visual Studio\2019\BuildTools"
+) do (
+    if not defined VCVARS if exist "%%~d\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%~d\VC\Auxiliary\Build\vcvars64.bat"
 )
 
-echo [*] æ­£åœ¨ç¼–è¯‘ LiteCap C++ ç‰ˆ...
-REM /MT      = é™æ€é“¾æ¥è¿è¡Œåº“ï¼Œç”Ÿæˆçš„ exe ä¸ä¾èµ– VC++ Redistributableï¼Œæ‹·èµ°å°±èƒ½è·‘
-REM /utf-8   = æºç å«ä¸­æ–‡æ³¨é‡Šï¼Œä¸åŠ ä¼šæŒ‰ GBK è§£è¯»
-REM MANIFEST:EMBED = æŠŠ comctl32 v6 manifest åµŒè¿› exeï¼ˆå¯ç”¨ç°ä»£æ§ä»¶å¤–è§‚ï¼Œ
-REM                  ä¸” CB_SETMINVISIBLE ç­‰ v6 æ¶ˆæ¯æ‰ç”Ÿæ•ˆï¼‰
+REM 1b) Â·¾¶Ã»É¨µ½£¬ÔÙÊÔ¹Ù·½ vswhere
+if not defined VCVARS (
+    set "VSWHERE=%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe"
+    if exist "!VSWHERE!" (
+        for /f "usebackq tokens=*" %%i in (`"!VSWHERE!" -latest -prerelease -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+        if defined VSPATH if exist "!VSPATH!\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=!VSPATH!\VC\Auxiliary\Build\vcvars64.bat"
+    )
+)
+
+if not defined VCVARS (
+    echo [x] Ã»ÓĞÕÒµ½ Visual C++ Éú³É¹¤¾ß¡£
+    echo     Çë°²×° Visual Studio µÄ¡¸Ê¹ÓÃ C++ µÄ×ÀÃæ¿ª·¢¡¹¹¤×÷¸ºÔØ£¬
+    echo     »òÕß¸ÄÔÚ¡¸x64 Native Tools Command Prompt¡¹ÀïÔËĞĞ±¾½Å±¾¡£
+    exit /b 1
+)
+
+echo [*] Ê¹ÓÃ VC »·¾³: !VCVARS!
+call "!VCVARS!" >nul
+
+:have_env
+
+REM ---- 2) È·±£ rc.exe ¿ÉÓÃ ----
+REM Ç¶ manifest ºÍ±àÍ¼±ê¶¼ÒªÓÃµ½×ÊÔ´±àÒëÆ÷¡£vcvars64.bat Õı³£Çé¿öÏÂ»á°ÑËü¼Ó½ø PATH£¬
+REM µ«ÔÚÄ³Ğ©»·¾³£¨VS Insiders¡¢¾«¼ò°²×°¡¢ÊÜÏŞÈ¨ÏŞ£©ÏÂ»áÂ©µô£¬ÕâÀï¶µµ×ÕÒÒ»´Î¡£
+where rc.exe >nul 2>nul
+if errorlevel 1 (
+    set "SDKBIN="
+    for /d %%v in ("%ProgramFiles(x86)%\Windows Kits\10\bin\10.*") do (
+        if not defined SDKBIN if exist "%%~v\x64\rc.exe" set "SDKBIN=%%~v\x64"
+    )
+    if not defined SDKBIN if exist "%ProgramFiles(x86)%\Windows Kits\10\bin\x64\rc.exe" set "SDKBIN=%ProgramFiles(x86)%\Windows Kits\10\bin\x64"
+    if defined SDKBIN (
+        set "PATH=!SDKBIN!;!PATH!"
+        echo [i] ÒÑÊÖ¶¯¼ÓÈë SDK ¹¤¾ßÄ¿Â¼: !SDKBIN!
+    ) else (
+        echo [!] Î´ÕÒµ½ rc.exe£¬½«Ìø¹ıÍ¼±ê£¨³ÌĞòÈÔ¿É±àÒë£¬Ö»ÊÇÃ»ÓĞ×Ô¶¨ÒåÍ¼±ê£©¡£
+    )
+)
+
+REM ---- 3) Í¼±ê×ÊÔ´£¨È±Í¼±êÒ²ÄÜ±à£©----
+set "RES="
+if exist res\app.ico (
+    where rc.exe >nul 2>nul
+    if not errorlevel 1 (
+        echo [*] ±àÒëÍ¼±ê×ÊÔ´...
+        rc.exe /nologo /fo build\app.res res\app.rc
+        if errorlevel 1 (
+            echo [x] ×ÊÔ´±àÒëÊ§°Ü¡£
+            exit /b 1
+        )
+        set "RES=build\app.res"
+    )
+)
+
+REM ---- 4) ±àÒëÁ´½Ó ----
+REM /MT             = ¾²Ì¬Á´½ÓÔËĞĞ¿â£¬Éú³ÉµÄ exe ²»ÒÀÀµ VC++ Redistributable£¬¿½×ß¾ÍÄÜÅÜ
+REM /utf-8          = Ô´Âëº¬ÖĞÎÄ×¢ÊÍ£¬²»¼Ó»á°´ GBK ½â¶Á
+REM /MANIFEST:EMBED = °Ñ comctl32 v6 manifest Ç¶½ø exe¡£±ØĞë¼Ó£¬·ñÔò¿Ø¼şÍË»Ø¾­µäÍâ¹Û£¬
+REM                    ÇÒ CB_SETMINVISIBLE µÈ v6 ÏûÏ¢»áÊ§°Ü£¨ÏÂÀ­ÁĞ±íÕ¹¿ªºóÊ²Ã´¶¼¿´²»µ½£©
+echo [*] ÕıÔÚ±àÒë LiteCap...
 cl.exe /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
     /I src ^
-    src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp ^
+    src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp %RES% ^
     /Fo:build\ /Fe:LiteCap.exe ^
     /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
     mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
@@ -42,11 +105,11 @@ cl.exe /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
 
 if errorlevel 1 (
     echo.
-    echo [x] ç¼–è¯‘å¤±è´¥ã€‚
+    echo [x] ±àÒëÊ§°Ü¡£
     exit /b 1
 )
 
 echo.
-echo [ok] æ„å»ºå®Œæˆï¼š %cd%\LiteCap.exe
-echo [i] è¿è¡Œå‰è¯·ç¡®è®¤ lang\ ä¸ exe åœ¨åŒä¸€ç›®å½•ï¼ˆè¯­è¨€åŒ…ï¼‰ã€‚
+echo [ok] ¹¹½¨Íê³É: %cd%\LiteCap.exe
+echo [i] ÔËĞĞÇ°ÇëÈ·ÈÏ lang\ Óë exe ÔÚÍ¬Ò»Ä¿Â¼£¨ÓïÑÔ°ü£©¡£
 endlocal

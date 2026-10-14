@@ -58,3 +58,10 @@ private:
 
 // ---------------- 输出目录默认值 ----------------
 std::wstring DefaultOutputDir();
+
+// ---------------- 图标 ----------------
+// 资源 ID，与 res/app.rc 里一致
+#define IDI_APPICON 1
+
+// 按实际需要的尺寸加载图标。不指定尺寸的话系统会把 32x32 硬缩到 16x16，边缘会糊。
+HICON LoadAppIcon(HINSTANCE inst, int cx, int cy);

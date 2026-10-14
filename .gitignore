@@ -20,6 +20,10 @@ _probe/*.mp4
 _test/*.png
 _test/*.log
 
+# ---------- 工具产物 ----------
+_tools/preview/
+_tools/*.png
+
 # ---------- Python 版 ----------
 __pycache__/
 *.py[cod]

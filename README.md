@@ -6,20 +6,12 @@
 
 本仓库包含两个独立实现：
 
-| 实现 | 位置 | 说明 |
-| --- | --- | --- |
-| **C++ 版**（推荐） | 仓库根目录 | 纯 Win32 + Media Foundation，单文件 325 KB，无需运行库 |
-| Python 版（存档） | [`python/`](python/) | PySide6 + PyAV，源码可直接跑，打包后 84 MB |
+| 实现            | 位置                   | 说明                                          |
+| ------------- | -------------------- | ------------------------------------------- |
+| **C++ 版**（推荐） | 仓库根目录                | 纯 Win32 + Media Foundation，单文件 340 KB，无需运行库 |
+| Python 版（存档）  | [`python/`](python/) | PySide6 + PyAV，源码可直接跑，打包后 84 MB             |
 
----
-
-## 为什么会有这个项目
-
-起因是想给一款商业录屏软件做「精简 + 去网络 + 本地化」。逆向分析后发现它的主程序被
-**Themida** 加壳（`.themida` 节 7.78 MB 虚拟区、`.boot` 节熵值 7.95、导入表被削到每个
-DLL 只剩 1 个函数），静态改造不可行；而强行脱壳改包属于绕过商业授权保护，不做。
-
-于是改成自建：只保留真正需要的功能，从根上就没有网络模块。
+<img src="res/app.ico" width="72" alt="LiteCap 图标">
 
 ---
 
@@ -29,17 +21,17 @@ DLL 只剩 1 个函数），静态改造不可行；而强行脱壳改包属于�
 
 ### 功能
 
-| 功能 | 说明 |
-| --- | --- |
-| 全屏 / 指定显示器 / 自定义区域 | 区域框选支持多显示器与负坐标 |
-| 帧率 10 / 15 / 20 / 24 / 30 / 60 / **120** fps | 实测 120fps 能跑到 **119.6fps** |
-| 画质 高 / 中 / 低 | 码率随分辨率与帧率自适应，高帧率按 `sqrt` 衰减 |
-| 输出到 `D:\Recordings` | D 盘不存在时自动退回用户「视频」目录 |
-| 录制记录列表 | 文件名 / 时长 / 大小 / 录制时间，存于 `history.tsv` |
-| **软件内播放** | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭 |
-| **右键菜单** | 在软件中播放 · 打开所在目录 · 复制完整路径 · 从列表移除 · 删除文件 |
-| 悬浮窗模式 | 圆角置顶小条，随时开始/停止，实时计时，位置记忆 |
-| 中英文界面 | `lang/*.ini` 语言包，切换即时生效 |
+| 功能                                           | 说明                                      |
+| -------------------------------------------- | --------------------------------------- |
+| 全屏 / 指定显示器 / 自定义区域                           | 区域框选支持多显示器与负坐标                          |
+| 帧率 10 / 15 / 20 / 24 / 30 / 60 / **120** fps | 实测 120fps 能跑到 **119.6fps**              |
+| 画质 高 / 中 / 低                                 | 码率随分辨率与帧率自适应，高帧率按 `sqrt` 衰减             |
+| 输出到 `D:\Recordings`                          | D 盘不存在时自动退回用户「视频」目录                     |
+| 录制记录列表                                       | 文件名 / 时长 / 大小 / 录制时间，存于 `history.tsv`   |
+| **软件内播放**                                    | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭        |
+| **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 复制完整路径 · 从列表移除 · 删除文件 |
+| 悬浮窗模式                                        | 圆角置顶小条，随时开始/停止，实时计时，位置记忆                |
+| 中英文界面                                        | `lang/*.ini` 语言包，切换即时生效                 |
 
 <table>
 <tr>
@@ -66,8 +58,9 @@ build.bat
 <summary>手动编译命令</summary>
 
 ```bat
+rc /nologo /fo build\app.res res\app.rc
 cl /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
-   /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp ^
+   /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp build\app.res ^
    /Fo:build\ /Fe:LiteCap.exe ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
    mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
@@ -79,6 +72,9 @@ cl /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
 - `/MT` —— 静态链接运行库，exe 不依赖 VC++ Redistributable。
 - `/MANIFEST:EMBED` —— 嵌入 comctl32 v6 manifest。**必须加**，否则控件退回经典外观，
   且 `CB_SETMINVISIBLE` 等 v6 消息会失败（表现为下拉列表展开后高度为 0、什么都看不到）。
+
+> 手动编译时若报 `LNK1158: 无法运行 rc.exe`，说明 SDK 的 `bin\<ver>\x64` 不在 PATH 里
+> （`/MANIFEST:EMBED` 会调用资源编译器）。用 `build.bat` 则不存在这个问题。
 
 </details>
 
@@ -107,9 +103,9 @@ Windows 默认调度精度约 **15.6 ms**，而 60fps 的帧间隔是 16.7ms、1
 
 实测（1920×1080）：
 
-| 档位 | 标称 | 实测 |
-| --- | --- | --- |
-| 30 fps | 30/1 | 29.90 fps |
+| 档位      | 标称             | 实测             |
+| ------- | -------------- | -------------- |
+| 30 fps  | 30/1           | 29.90 fps      |
 | 120 fps | 10000000/83333 | **119.62 fps** |
 
 #### 时间戳必须严格递增
@@ -148,8 +144,11 @@ MFPlay 的 `IMFPMediaPlayer::GetDuration` / `IMFPMediaItem::GetDuration`
 ├─ lang/
 │  ├─ zh-CN.ini         简体中文
 │  └─ en-US.ini         English
+├─ res/
+│  ├─ app.ico           程序图标（9 个尺寸，16~256）
+│  └─ app.rc            图标资源脚本
 ├─ src/
-│  ├─ common.h/.cpp     字符串 / 路径 / 格式化 / 配置 / 本地化
+│  ├─ common.h/.cpp     字符串 / 路径 / 格式化 / 配置 / 本地化 / 图标加载
 │  ├─ recorder.h/.cpp   GDI 抓屏 + H.264 编码 + 录制线程
 │  ├─ history.h/.cpp    录制记录（TSV 持久化）
 │  ├─ player.h/.cpp     软件内播放（Media Foundation MFPlay）
@@ -157,9 +156,29 @@ MFPlay 的 `IMFPMediaPlayer::GetDuration` / `IMFPMediaItem::GetDuration`
 ├─ _probe/
 │  └─ fps_probe.cpp     读 MP4 真实参数的辅助工具
 ├─ _test/               自动化端到端测试脚本
+├─ _tools/
+│  ├─ make_icon.py      生成 res/app.ico
+│  └─ verify_icon.py    从 exe 抽图标做验证
 ├─ docs/                界面截图
 └─ python/              Python 版存档
 ```
+
+### 图标
+
+`res/app.ico` 由 `_tools/make_icon.py` 生成，**不依赖 Pillow** —— 在高分辨率画布上做
+几何判定，再降采样得到抗锯齿，最后打包成多尺寸 ICO：
+
+```bash
+python _tools/make_icon.py --preview   # 生成 ico + 各尺寸预览图
+```
+
+设计是深色圆角方块 + 白色「屏幕」描边 + 中心红色录制点，配色与程序内的悬浮窗
+（`#1A1C20`）和录制按钮（`#D63B3B`）一致。小尺寸（≤24px）会收细描边、缩小圆点，
+否则 16px 下红点会贴住白框糊成一团。
+
+窗口图标在 `common.cpp` 的 `LoadAppIcon` 里按实际尺寸加载（大图标给 Alt+Tab 与任务栏，
+小图标给标题栏）。不按尺寸加载的话系统会把 32×32 硬缩到 16×16，边缘会糊。
+
 
 ### 自动化测试
 
@@ -212,15 +231,15 @@ $ fps_probe.exe D:\Recordings\LiteCap_20261015_041214.mp4
 
 见 [`python/`](python/)，保留完整源码与文档。
 
-| | C++ 版 | Python 版 |
-| --- | --- | --- |
-| 分发体积 | **325 KB** | 84 MB（PyInstaller one-file） |
-| 运行依赖 | 无（静态链接） | 无（已打包） |
-| 启动速度 | 即时 | 需解压到临时目录，较慢 |
-| 录制记录 / 软件内播放 / 右键菜单 | ✅ | — |
-| 悬浮窗模式 | ✅ | ✅ |
-| 中英双语 | ✅ | ✅ |
-| 依赖 | MSVC（仅编译时） | PySide6 / mss / PyAV / numpy |
+|                     | C++ 版      | Python 版                     |
+| ------------------- | ---------- | ---------------------------- |
+| 分发体积                | **340 KB** | 84 MB（PyInstaller one-file）  |
+| 运行依赖                | 无（静态链接）    | 无（已打包）                       |
+| 启动速度                | 即时         | 需解压到临时目录，较慢                  |
+| 录制记录 / 软件内播放 / 右键菜单 | ✅          | —                            |
+| 悬浮窗模式               | ✅          | ✅                            |
+| 中英双语                | ✅          | ✅                            |
+| 依赖                  | MSVC（仅编译时） | PySide6 / mss / PyAV / numpy |
 
 Python 版额外提供一个离线自检：
 
@@ -246,4 +265,3 @@ python python/LiteCap.py --self-check
 ## 授权
 
 本项目为独立实现，与任何商业录屏软件无代码或授权关系。
-

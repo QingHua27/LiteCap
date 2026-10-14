@@ -98,6 +98,13 @@ std::wstring DefaultOutputDir() {
     return L".\\Recordings";
 }
 
+// ---------------- 图标 ----------------
+
+HICON LoadAppIcon(HINSTANCE inst, int cx, int cy) {
+    return (HICON)LoadImageW(inst, MAKEINTRESOURCEW(IDI_APPICON), IMAGE_ICON,
+                             cx, cy, LR_DEFAULTCOLOR);
+}
+
 // ---------------- 配置文件读写 ----------------
 
 static bool ReadAllText(const std::wstring& path, std::string& out) {

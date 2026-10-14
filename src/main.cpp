@@ -952,6 +952,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     wc.lpszClassName = kMainClass;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+    wc.hIcon   = LoadAppIcon(inst, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+    wc.hIconSm = LoadAppIcon(inst, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
     RegisterClassExW(&wc);
 
     WNDCLASSEXW bc = { sizeof(bc) };

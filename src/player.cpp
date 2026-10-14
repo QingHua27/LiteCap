@@ -217,6 +217,8 @@ bool Player::Open(HINSTANCE inst, const std::wstring& path, I18n* i18n) {
         wc.lpszClassName = kPlayerClass;
         wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
         wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+        wc.hIcon   = LoadAppIcon(inst, GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON));
+        wc.hIconSm = LoadAppIcon(inst, GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON));
         RegisterClassExW(&wc);
 
         WNDCLASSEXW vc = { sizeof(vc) };
