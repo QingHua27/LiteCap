@@ -209,6 +209,21 @@ def force_foreground(hwnd):
     return u32.GetForegroundWindow() == hwnd
 
 
+def control_text(hwnd, maxlen=256):
+    """跨进程读控件文本。
+
+    两个坑：
+    1. 不能用 GetWindowTextW —— 它读的是窗口标题缓存，BUTTON 的文字恰好就是
+       窗口标题所以能读到，但 EDIT 的真实文本在控件内部缓冲里，读出来永远是空串。
+    2. WM_GETTEXT 是系统替我们封送的消息，缓冲区必须放在**本进程**。
+       把缓冲区 VirtualAllocEx 到目标进程反而会失败（系统按调用方的地址空间封送，
+       结果读回 0 字节）。远程缓冲区那套只适用于 LVM_GETITEMRECT 这类不封送的消息。
+    """
+    buf = ctypes.create_unicode_buffer(maxlen)
+    u32.SendMessageW(hwnd, 0x000D, maxlen, ctypes.addressof(buf))   # WM_GETTEXT
+    return buf.value
+
+
 def double_click_first_row(main):
     """取列表第一项矩形 -> 真实鼠标双击。
     必须用真实输入：ListView 的双击判定读的是消息队列里的 GetMessagePos/GetMessageTime，

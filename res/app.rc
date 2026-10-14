@@ -6,3 +6,14 @@
 // 窗口图标在代码里用 LoadImageW 按实际尺寸加载，见 common.cpp 的 LoadAppIcon。
 
 1 ICON "app.ico"
+
+// 内置语言包。ID 与 src/common.h 里的 IDR_LANG_* 对应。
+//
+// 为什么要把语言文件塞进 exe：发布时只给一个 exe，没有 lang/ 目录，
+// 而界面文案全部来自语言包 —— 不带内置的话，用户下载后看到的是
+// target_all / pick_region / col_name 这种键名，等于不可用。
+//
+// 路径是相对本 .rc 文件所在目录（res/），所以要用 ..\lang\。
+// 外置 lang/*.ini 仍然有效，且优先级更高：只覆盖同名键，其余用内置值。
+101 RCDATA "..\\lang\\zh-CN.ini"
+102 RCDATA "..\\lang\\en-US.ini"

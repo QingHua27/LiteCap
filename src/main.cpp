@@ -19,6 +19,7 @@
 
 #include "common.h"
 #include "recorder.h"
+#include "wincap.h"
 #include "history.h"
 #include "player.h"
 
@@ -38,6 +39,8 @@ processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 enum {
     IDC_TARGET = 1001, IDC_PICK, IDC_FPS, IDC_QUALITY, IDC_LANG,
     IDC_DIR, IDC_BROWSE, IDC_RECORD, IDC_FLOAT, IDC_LIST, IDC_HINT,
+    IDC_HOTKEY_EDIT, IDC_HOTKEY_SET, IDC_PICK_WIN, IDC_HIST_TOGGLE,
+    IDC_ENCODER, IDC_AUDIO_SYSTEM, IDC_AUDIO_MIC,
 };
 enum {
     IDM_PLAY = 4001, IDM_OPEN_DIR, IDM_COPY_PATH, IDM_REMOVE, IDM_DELETE_FILE,
@@ -51,6 +54,10 @@ static const int kFpsDefault = 4;   // 默认 30 fps
 static const wchar_t* kMainClass = L"LiteCapMainWnd";
 static const wchar_t* kBarClass  = L"LiteCapBarWnd";
 static const wchar_t* kSelClass  = L"LiteCapSelWnd";
+static const wchar_t* kHotkeyClass = L"LiteCapHotkeyWnd";
+
+// 全局热键：id 只要在本进程内唯一即可
+static const int kHotkeyId = 0xB001;
 
 // ---------------- 全局状态 ----------------
 static HINSTANCE   g_inst = nullptr;
@@ -65,12 +72,37 @@ static I18n        g_i18n;
 static History     g_hist;
 static Recorder    g_rec;
 static bool        g_floatMode = false;
+static bool        g_encShown = false;   // 本次录制是否已在标题栏标出编码器
+
+// 录制记录是否展开。界面是两栏：左边一列设置项，右边一块录制记录。
+// 收起时右栏整块消失、窗口收窄回单栏宽度 —— 只藏控件不缩窗口的话，
+// 底下会留一大块空白，看着像界面坏了。
+static bool        g_histOpen = true;
+static int         g_listH = 0;          // 列表高度，按窗口高度自适应并记住
+
+// 两栏的宽度。左栏固定，右栏是展开时额外加出来的宽度。
+static int         g_colW = 0;           // 左栏（设置项）的客户区宽度
+static int         g_rightW = 0;         // 右栏（录制记录）额外占用的宽度
 
 // 主窗口控件
-static HWND g_lblTarget, g_cmbTarget, g_btnPick, g_lblFps, g_cmbFps;
+static HWND g_lblTarget, g_cmbTarget, g_btnPick, g_btnPickWin;
+static HWND g_lblFps, g_cmbFps;
 static HWND g_lblQuality, g_cmbQuality, g_lblLang, g_cmbLang;
+// 编码器三选一。值和 recorder.h 的 EncMode 对应：
+//   0 = Auto     优先硬件，失败自动退软件
+//   1 = Hardware 强制硬件，失败就失败（宁可录不出来也不偷偷降级）
+//   2 = Software 强制软件
+// 硬件编码在 120fps 下追不上（见 recorder.cpp 的 kHardwareMaxFps），
+// 所以这个选项不是摆设：测试和排障都靠它固定变量。
+static HWND g_lblEncoder, g_cmbEncoder;
+static HWND g_chkSystemAudio, g_chkMicrophone;
 static HWND g_lblDir, g_edtDir, g_btnBrowse, g_btnRecord, g_btnFloat;
+static HWND g_lblHotkey, g_edtHotkey, g_btnHotkey;
 static HWND g_lblHist, g_lblHint;
+
+// 目标下拉里的窗口条目。下标和 g_cmbTarget 里「窗口段」一一对应，
+// 选中时直接按下标取，不用再去解析字符串。
+static std::vector<WinItem> g_targetWins;
 
 // 悬浮窗状态
 static int  g_barDragX = 0, g_barDragY = 0;
@@ -388,8 +420,24 @@ void RefreshMonitors() {
         }, 0);
 }
 
+// 目标下拉里「窗口段」之前的固定条目数：
+//   0          全部屏幕
+//   1..N       显示器 1..N
+//   N+1        区域 W×H（只有框选过才有这一条）
+// 之后的条目就是 g_targetWins[sel - TargetFixedCount()]。
+int TargetFixedCount() {
+    return 1 + (int)g_monitors.size() + (g_cfg.Get("region").empty() ? 0 : 1);
+}
+
 void RefreshTargetCombo() {
+    const std::wstring t      = g_cfg.Get("target", L"all");
+    const std::wstring wtitle = g_cfg.Get("window_title");
+    const std::wstring wexe   = g_cfg.Get("window_exe");
+    const bool hasRegion = !g_cfg.Get("region").empty();
+
     SendMessageW(g_cmbTarget, CB_RESETCONTENT, 0, 0);
+    g_targetWins.clear();
+
     SendMessageW(g_cmbTarget, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("target_all").c_str());
     for (size_t i = 0; i < g_monitors.size(); ++i) {
         wchar_t buf[128];
@@ -399,15 +447,52 @@ void RefreshTargetCombo() {
                  r.right - r.left, r.bottom - r.top);
         SendMessageW(g_cmbTarget, CB_ADDSTRING, 0, (LPARAM)buf);
     }
-    if (!g_cfg.Get("region").empty())
+    if (hasRegion)
         SendMessageW(g_cmbTarget, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("target_region").c_str());
 
-    std::wstring t = g_cfg.Get("target", L"all");
+    const int fixed = TargetFixedCount();
+
+    // 标题 + 进程名都一样的窗口合并成一条。有些程序（记事本多开、浏览器多窗口）
+    // 会开一堆同标题窗口，全列出来只会把下拉撑爆，而它们录出来其实没区别。
+    for (const WinItem& w : EnumCaptureWindows()) {
+        bool dup = false;
+        for (const WinItem& p : g_targetWins)
+            if (p.title == w.title && p.exe == w.exe) { dup = true; break; }
+        if (dup) continue;
+
+        wchar_t buf[768];
+        swprintf(buf, 768, L"%s: %s (%s)", g_i18n.T("target_window").c_str(),
+                 w.title.c_str(), w.exe.c_str());
+        SendMessageW(g_cmbTarget, CB_ADDSTRING, 0, (LPARAM)buf);
+        g_targetWins.push_back(w);
+    }
+
     int sel = 0;
-    if (t == L"region" && !g_cfg.Get("region").empty()) sel = (int)g_monitors.size() + 1;
-    else if (t.rfind(L"mon:", 0) == 0) {
+    if (t == L"region" && hasRegion) {
+        sel = (int)g_monitors.size() + 1;
+    } else if (t.rfind(L"mon:", 0) == 0) {
         int idx = _wtoi(t.c_str() + 4);
         if (idx >= 1 && idx <= (int)g_monitors.size()) sel = idx;
+    } else if (t == L"window" && !wtitle.empty()) {
+        for (size_t i = 0; i < g_targetWins.size(); ++i) {
+            if (g_targetWins[i].title == wtitle && g_targetWins[i].exe == wexe) {
+                sel = fixed + (int)i;
+                break;
+            }
+        }
+        if (sel == 0) {
+            // 上次录的那个窗口现在没开。补一条占位，别让选择悄悄跳回「全部屏幕」——
+            // 那会导致用户以为还在录那个程序，实际录了整个屏幕。
+            std::wstring label = g_i18n.T("target_window") + L": " + wtitle;
+            if (!wexe.empty()) label += L" (" + wexe + L")";
+            label += L" " + g_i18n.T("target_window_off");
+            SendMessageW(g_cmbTarget, CB_ADDSTRING, 0, (LPARAM)label.c_str());
+            WinItem ph;
+            ph.title = wtitle;
+            ph.exe = wexe;
+            g_targetWins.push_back(ph);
+            sel = fixed + (int)g_targetWins.size() - 1;
+        }
     }
     SendMessageW(g_cmbTarget, CB_SETCURSEL, sel, 0);
 }
@@ -423,6 +508,52 @@ void RefreshLangCombo() {
     SendMessageW(g_cmbLang, CB_SETCURSEL, sel, 0);
 }
 
+// LVITEMW 的一次性构造。
+// 注意：C++20 起不允许对临时对象取地址（C2102），
+// 所以不能再写 &(LVITEMW{...})，得先落到一个局部变量上。
+LVITEMW MakeLvItem(int sub, LPWSTR text) {
+    LVITEMW li = {};
+    li.mask = LVIF_TEXT;
+    li.iSubItem = sub;
+    li.pszText = text;
+    return li;
+}
+
+// 录制记录列表的列。
+// 只有三列：文件名里本来就带时间戳（LiteCap_20261015_052526.mp4），
+// 再单开一列「录制时间」纯属浪费 —— 界面收窄一半之后横向空间得省着用。
+void ApplyListColumns() {
+    if (!g_list) return;
+    while (SendMessageW(g_list, LVM_DELETECOLUMN, 0, 0)) {}
+    LVCOLUMNW col = {};
+    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    const char* keys[3] = { "col_name", "col_duration", "col_size" };
+    const int widths[3] = { 150, 58, 72 };      // 占位值，SizeListColumns 会按实际宽度重算
+    for (int i = 0; i < 3; ++i) {
+        std::wstring txt = g_i18n.T(keys[i]);
+        col.iSubItem = i;
+        col.pszText = (LPWSTR)txt.c_str();
+        col.cx = S(widths[i]);
+        SendMessageW(g_list, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
+    }
+}
+
+// 按列表控件的实际宽度分配列宽。用 LVM_SETCOLUMNWIDTH 而不是删了重建，
+// 后者在拖窗口的时候会闪。
+void SizeListColumns() {
+    if (!g_list) return;
+    RECT lr = {};
+    if (!GetClientRect(g_list, &lr) || lr.right <= 0) return;
+    const int avail = lr.right - S(6);          // 给竖向滚动条留一点
+    int wName = avail * 56 / 100;
+    int wDur  = avail * 20 / 100;
+    int wSize = avail - wName - wDur;
+    if (wName < S(60)) wName = S(60);
+    SendMessageW(g_list, LVM_SETCOLUMNWIDTH, 0, wName);
+    SendMessageW(g_list, LVM_SETCOLUMNWIDTH, 1, wDur);
+    SendMessageW(g_list, LVM_SETCOLUMNWIDTH, 2, wSize);
+}
+
 void RefreshHistoryList() {
     SendMessageW(g_list, LVM_DELETEALLITEMS, 0, 0);
     const auto& items = g_hist.Items();
@@ -436,30 +567,254 @@ void RefreshHistoryList() {
 
         std::wstring dur = FormatDuration(it.durationMs);
         std::wstring sz = FormatBytes(it.bytes);
-        std::wstring when = FormatDateTime(it.epoch);
-        SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&(LVITEMW{ LVIF_TEXT, row, 1, 0, 0, (LPWSTR)dur.c_str() }));
-        SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&(LVITEMW{ LVIF_TEXT, row, 2, 0, 0, (LPWSTR)sz.c_str() }));
-        SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&(LVITEMW{ LVIF_TEXT, row, 3, 0, 0, (LPWSTR)when.c_str() }));
+        LVITEMW c1 = MakeLvItem(1, (LPWSTR)dur.c_str());
+        LVITEMW c2 = MakeLvItem(2, (LPWSTR)sz.c_str());
+        SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&c1);
+        SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&c2);
     }
+}
+
+// ---------------- 全局热键 ----------------
+static UINT g_hotkeyMod = MOD_CONTROL | MOD_ALT;
+static UINT g_hotkeyVk  = 'R';
+
+// 拼成 "Ctrl+Alt+R" 这样的可读文本
+std::wstring FormatHotkey(UINT mod, UINT vk) {
+    if (!vk) return g_i18n.T("hotkey_none");
+    std::wstring s;
+    if (mod & MOD_CONTROL) s += L"Ctrl+";
+    if (mod & MOD_ALT)     s += L"Alt+";
+    if (mod & MOD_SHIFT)   s += L"Shift+";
+    if (mod & MOD_WIN)     s += L"Win+";
+
+    // GetKeyNameText 要的是扫描码左移 16 位；小键盘和这几个键还得带上扩展位，
+    // 否则 NumLock 会被念成 "Num 5" 之类的怪名字。
+    UINT sc = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    LONG lp = (LONG)(sc << 16);
+    switch (vk) {
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN:
+    case VK_PRIOR: case VK_NEXT: case VK_END: case VK_HOME:
+    case VK_INSERT: case VK_DELETE: case VK_DIVIDE: case VK_NUMLOCK:
+        lp |= 1 << 24;
+        break;
+    default: break;
+    }
+    wchar_t name[64] = {};
+    if (GetKeyNameTextW(lp, name, 64) > 0) {
+        s += name;
+    } else {
+        wchar_t b[16];
+        if (vk >= VK_F1 && vk <= VK_F24)       swprintf(b, 16, L"F%u", vk - VK_F1 + 1);
+        else if ((vk >= '0' && vk <= '9') ||
+                 (vk >= 'A' && vk <= 'Z'))     swprintf(b, 16, L"%c", (wchar_t)vk);
+        else                                   swprintf(b, 16, L"0x%02X", vk);
+        s += b;
+    }
+    return s;
+}
+
+void UpdateHotkeyText() {
+    if (!g_edtHotkey) return;
+    SetWindowTextW(g_edtHotkey, FormatHotkey(g_hotkeyMod, g_hotkeyVk).c_str());
+}
+
+// 注册失败基本都是组合已被别的程序占了，返回 false 交给调用方提示。
+bool RegisterAppHotkey() {
+    UnregisterHotKey(g_main, kHotkeyId);
+    if (!g_hotkeyVk) return true;    // 空 = 用户主动清掉，不注册
+    return RegisterHotKey(g_main, kHotkeyId, g_hotkeyMod | MOD_NOREPEAT,
+                          g_hotkeyVk) != FALSE;
+}
+
+// ---------------- 快捷键录制窗口 ----------------
+static UINT g_hkMod = 0, g_hkKey = 0;
+static bool g_hkDone = false, g_hkOk = false;
+
+LRESULT CALLBACK HotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    switch (m) {
+    case WM_KEYDOWN:
+    case WM_SYSKEYDOWN: {
+        UINT vk = (UINT)w;
+        // Alt+F4 是系统级关闭命令，不要误记录成「Alt+F4」热键。
+        // 按常规窗口关闭路径收尾，让 PickHotkey 恢复 owner 并释放模态状态。
+        if (m == WM_SYSKEYDOWN && vk == VK_F4 && (l & (1L << 29))) {
+            SendMessageW(h, WM_CLOSE, 0, 0);
+            return 0;
+        }
+        if (vk == VK_ESCAPE) { g_hkDone = true; g_hkOk = false; return 0; }
+        if (vk == VK_BACK || vk == VK_DELETE) {
+            g_hkMod = 0; g_hkKey = 0; g_hkDone = true; g_hkOk = true;
+            return 0;
+        }
+        // 只按修饰键不算数，继续等真正的那个键
+        if (vk == VK_CONTROL || vk == VK_SHIFT || vk == VK_MENU ||
+            vk == VK_LWIN || vk == VK_RWIN) return 0;
+
+        UINT mod = 0;
+        if (GetKeyState(VK_CONTROL) & 0x8000) mod |= MOD_CONTROL;
+        if (GetKeyState(VK_SHIFT)   & 0x8000) mod |= MOD_SHIFT;
+        if (GetKeyState(VK_MENU)    & 0x8000) mod |= MOD_ALT;
+        if ((GetKeyState(VK_LWIN) & 0x8000) ||
+            (GetKeyState(VK_RWIN) & 0x8000))  mod |= MOD_WIN;
+        // 裸键会抢掉全系统的普通按键，不允许
+        if (!mod) return 0;
+
+        g_hkMod = mod; g_hkKey = vk; g_hkDone = true; g_hkOk = true;
+        return 0;
+    }
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(h, &ps);
+        RECT rc; GetClientRect(h, &rc);
+        SetBkMode(dc, TRANSPARENT);
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+
+        HGDIOBJ old = SelectObject(dc, g_fontBold);
+        RECT r1 = rc; r1.top += S(26);
+        std::wstring t = g_i18n.T("hotkey_capture_hint");
+        DrawTextW(dc, t.c_str(), -1, &r1, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+
+        SelectObject(dc, g_font);
+        RECT r2 = rc; r2.top += S(62);
+        std::wstring s = g_i18n.T("hotkey_capture_sub");
+        DrawTextW(dc, s.c_str(), -1, &r2, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        EndPaint(h, &ps);
+        return 0;
+    }
+
+    case WM_CLOSE:
+        // 点标题栏 X / 按 Alt+F4 时，必须让模态循环收尾。
+        // 仅走 DefWindowProc 会销毁对话框但 g_hkDone 仍为 false；
+        // 主窗口会一直保持禁用，消息循环卡死，连退出按钮也点不了。
+        g_hkOk = false;
+        g_hkDone = true;
+        return 0;
+
+    case WM_DESTROY:
+        // 兜住意外 DestroyWindow：不能把父窗口永久留在禁用状态。
+        if (!g_hkDone) {
+            g_hkOk = false;
+            g_hkDone = true;
+        }
+        return 0;
+    }
+    return DefWindowProcW(h, m, w, l);
+}
+
+// 模态地录一个组合键；返回 false 表示用户取消
+bool PickHotkey(HWND owner, UINT& mod, UINT& vk) {
+    g_hkMod = 0; g_hkKey = 0; g_hkDone = false; g_hkOk = false;
+
+    RECT orc; GetWindowRect(owner, &orc);
+    int w = S(440), hh = S(150);
+    int x = orc.left + ((orc.right - orc.left) - w) / 2;
+    int y = orc.top + ((orc.bottom - orc.top) - hh) / 2;
+
+    HWND dlg = CreateWindowExW(WS_EX_TOPMOST | WS_EX_DLGMODALFRAME, kHotkeyClass, L"",
+                               WS_POPUP | WS_CAPTION | WS_SYSMENU,
+                               x, y, w, hh, owner, nullptr, g_inst, nullptr);
+    if (!dlg) return false;
+
+    const bool ownerWasEnabled = IsWindowEnabled(owner) != FALSE;
+    EnableWindow(owner, FALSE);
+    ShowWindow(dlg, SW_SHOW);
+    SetForegroundWindow(dlg);
+    SetFocus(dlg);
+
+    // 嵌套模态消息循环。WM_CLOSE 会由 HotkeyProc 标记完成，随后统一恢复父窗；
+    // GetMessageW 返回 0/-1 时也必须走同一清理路径，否则父窗会一直禁用。
+    MSG msg = {};
+    int gm = 0;
+    while (!g_hkDone && (gm = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    if (gm == 0) {
+        // 不吞掉应用主消息循环的退出请求。
+        PostQuitMessage((int)msg.wParam);
+        g_hkOk = false;
+    } else if (gm < 0) {
+        g_hkOk = false;
+    }
+
+    if (IsWindow(dlg)) DestroyWindow(dlg);
+    if (IsWindow(owner)) {
+        EnableWindow(owner, ownerWasEnabled ? TRUE : FALSE);
+        if (ownerWasEnabled) {
+            SetActiveWindow(owner);
+            SetForegroundWindow(owner);
+            SetFocus(owner);
+        }
+    }
+
+    if (g_hkOk) { mod = g_hkMod; vk = g_hkKey; }
+    return g_hkOk;
 }
 
 void ApplyFont(HWND c) { SendMessageW(c, WM_SETFONT, (WPARAM)g_font, TRUE); }
 
-void Retranslate() {
+// 主窗口标题。录制中会追加编码器类型，见 OnRecEvent 的 WM_REC_TICK 分支。
+void SetMainTitle(const wchar_t* suffix = nullptr) {
     std::wstring title = std::wstring(L"LiteCap 1.0  \u00B7  ") + g_i18n.T("app_subtitle");
+    if (suffix && *suffix) title += std::wstring(L"  \u2014  ") + suffix;
     SetWindowTextW(g_main, title.c_str());
+}
+
+// 录制记录标题栏上的小三角：◂ 展开 / ▸ 收起
+//
+// 原来是 ▾/▸（向下 / 向右）—— 那是列表在下方时的说法。
+// 现在改成两栏、列表往右展开，箭头也得跟着横过来：
+//   ▸ 表示「点一下会从右边长出来」，◂ 表示「点一下会折回左边」。
+// 继续挂个向下的三角，会让人以为列表是往下弹的。
+void UpdateHistoryHeader() {
+    if (!g_lblHist) return;
+    std::wstring t = g_histOpen ? L"\u25C2  " : L"\u25B8  ";
+    t += g_i18n.T("history");
+    SetWindowTextW(g_lblHist, t.c_str());
+}
+
+// 录制按钮上的文字。
+// 编码器类型本来只挂在标题栏，但界面收窄之后标题被截成「LiteCap 1.0 · 极简离…」，
+// 那行提示就白写了 —— 挪到按钮上，宽度足够，而且录制时视线本来就在这儿。
+// 「区域模式」也挂这儿：那意味着这次没走窗口捕获、遮挡会进画面，
+// 属于用户必须知道的事，不能偷偷降级。
+std::wstring RecordButtonText() {
+    if (!g_rec.Running()) return g_i18n.T("start");
+    std::wstring s = g_i18n.T("stop");
+    if (g_encShown)
+        s += std::wstring(L"  \u00B7  ") +
+             (g_rec.LastHardware() ? g_i18n.T("enc_gpu") : g_i18n.T("enc_cpu"));
+    if (g_rec.RegionFallback())
+        s += std::wstring(L"  \u00B7  ") + g_i18n.T("cap_region");
+    return s;
+}
+
+void UpdateRecordButton() {
+    if (!g_btnRecord) return;
+    SetWindowTextW(g_btnRecord, RecordButtonText().c_str());
+}
+
+void Retranslate() {
+    SetMainTitle();
     SetWindowTextW(g_lblTarget, g_i18n.T("target").c_str());
     SetWindowTextW(g_lblFps, g_i18n.T("fps").c_str());
     SetWindowTextW(g_lblQuality, g_i18n.T("quality").c_str());
+    SetWindowTextW(g_lblEncoder, g_i18n.T("encoder").c_str());
+    SetWindowTextW(g_chkSystemAudio, g_i18n.T("audio_system").c_str());
+    SetWindowTextW(g_chkMicrophone, g_i18n.T("audio_microphone").c_str());
     SetWindowTextW(g_lblLang, g_i18n.T("language").c_str());
     SetWindowTextW(g_lblDir, g_i18n.T("output_dir").c_str());
-    SetWindowTextW(g_lblHist, g_i18n.T("history").c_str());
+    SetWindowTextW(g_lblHotkey, g_i18n.T("hotkey").c_str());
+    SetWindowTextW(g_btnHotkey, g_i18n.T("hotkey_set").c_str());
+    UpdateHistoryHeader();
     SetWindowTextW(g_lblHint, g_i18n.T("history_hint").c_str());
     SetWindowTextW(g_btnPick, g_i18n.T("pick_region").c_str());
+    SetWindowTextW(g_btnPickWin, g_i18n.T("pick_window").c_str());
     SetWindowTextW(g_btnBrowse, g_i18n.T("browse").c_str());
     SetWindowTextW(g_btnFloat, g_i18n.T("float_mode").c_str());
-    SetWindowTextW(g_btnRecord, g_rec.Running() ? g_i18n.T("stop").c_str()
-                                                : g_i18n.T("start").c_str());
+    UpdateRecordButton();
 
     // 画质下拉
     int qs = (int)SendMessageW(g_cmbQuality, CB_GETCURSEL, 0, 0);
@@ -469,106 +824,246 @@ void Retranslate() {
     SendMessageW(g_cmbQuality, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("quality_low").c_str());
     SendMessageW(g_cmbQuality, CB_SETCURSEL, qs < 0 ? 0 : qs, 0);
 
+    // 编码器下拉。三项顺序必须和 EncMode 的枚举值一致：
+    //   Auto / Hardware / Software —— recorder.cpp 里按下标取名。
+    int es = (int)SendMessageW(g_cmbEncoder, CB_GETCURSEL, 0, 0);
+    SendMessageW(g_cmbEncoder, CB_RESETCONTENT, 0, 0);
+    SendMessageW(g_cmbEncoder, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("enc_opt_auto").c_str());
+    SendMessageW(g_cmbEncoder, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("enc_opt_hardware").c_str());
+    SendMessageW(g_cmbEncoder, CB_ADDSTRING, 0, (LPARAM)g_i18n.T("enc_opt_software").c_str());
+    SendMessageW(g_cmbEncoder, CB_SETCURSEL, es < 0 ? 0 : es, 0);
+
     // 列：LVM_SETCOLUMNW 只能改已有列，创建列必须用 LVM_INSERTCOLUMNW。
     // 切换语言时要把旧列删掉重建，否则表头文字不会更新。
-    while (SendMessageW(g_list, LVM_DELETECOLUMN, 0, 0)) {}
-    LVCOLUMNW col = {};
-    col.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
-    const char* keys[4] = { "col_name", "col_duration", "col_size", "col_time" };
-    int widths[4] = { 220, 72, 78, 130 };
-    for (int i = 0; i < 4; ++i) {
-        std::wstring txt = g_i18n.T(keys[i]);
-        col.iSubItem = i;
-        col.pszText = (LPWSTR)txt.c_str();
-        col.cx = S(widths[i]);
-        SendMessageW(g_list, LVM_INSERTCOLUMNW, i, (LPARAM)&col);
-    }
+    ApplyListColumns();
 
     RefreshTargetCombo();
     RefreshLangCombo();
+    UpdateHotkeyText();
     if (g_bar) InvalidateRect(g_bar, nullptr, TRUE);
 }
 
-void LayoutMain() {
+// 排版。返回值是「当前状态下理想的客户区高度」——
+// 收起/展开记录区的时候要靠它把窗口收到刚好，否则底下会留一块空白。
+//
+// 两栏结构：
+//   左栏  设置项，宽度固定（g_colW），窗口再宽也不跟着拉伸
+//   右栏  录制记录，占用展开时额外加出来的那部分宽度
+// 左栏固定宽度是刻意的：控件宽度忽宽忽窄很难看，而且下拉、编辑框
+// 在窄宽度下本来就够用了。多出来的空间给列表更划算。
+//
+// fromResize=true 表示这次是用户真的在拖窗口，可以按实际高度重新分配列表；
+// false 表示这次只是为了算高度，列表高度必须用存下来的值，不能再从
+// rc.bottom 反推 —— 那样算出来的高度依赖当前窗口尺寸，会自相矛盾。
+int LayoutMain(bool fromResize) {
     RECT rc;
     GetClientRect(g_main, &rc);
-    int W = rc.right;
-    int pad = S(14), y = S(12), rowH = S(26), gap = S(8);
-    int lw = S(74);                                  // 标签列宽
-    int fx = pad + lw;
-    int fw = W - fx - pad;
-    int btnW = S(78);
+    const int W = rc.right;
+    const int pad = S(12);
+    const int rowH = S(26);
+    const int gap = S(8);
+    const int lw = S(52);                 // 左栏标签列
+    const int fx = pad + lw;
+    const int colContentW = g_colW - pad * 2;
+    const int fw = colContentW - lw;      // 左栏控件宽度
+    const int hintH = S(34);              // 提示两行
+    int y = S(12);
 
     auto place = [&](HWND c, int x, int yy, int w, int h) {
         MoveWindow(c, x, yy, w, h, TRUE);
     };
 
-    place(g_lblTarget, pad, y + S(3), lw, rowH);
+    // ---- 目标：下拉独占一行，下面一行放两个按钮 ----
     // ComboBox 的 height 参数指的是「下拉列表 + 文本区」的总高度，
     // 只给 rowH 会让列表部分≈0，展开后一项都看不到。这里留足列表空间。
-    place(g_cmbTarget, fx, y, fw - btnW - gap, rowH + S(180));
-    place(g_btnPick,   fx + fw - btnW, y, btnW, rowH);
-    y += rowH + gap;
+    place(g_lblTarget, pad, y + S(4), lw, rowH);
+    place(g_cmbTarget, fx, y, fw, rowH + S(180));
+    y += rowH + S(4);
 
-    place(g_lblFps, pad, y + S(3), lw, rowH);
+    const int halfW = (fw - gap) / 2;
+    place(g_btnPick,    fx, y, halfW, rowH);
+    place(g_btnPickWin, fx + halfW + gap, y, fw - halfW - gap, rowH);
+    y += rowH + gap + S(2);
+
+    // ---- 帧率 / 画质 / 语言 ----
+    place(g_lblFps, pad, y + S(4), lw, rowH);
     place(g_cmbFps, fx, y, fw, rowH + S(180));
     y += rowH + gap;
 
-    place(g_lblQuality, pad, y + S(3), lw, rowH);
+    place(g_lblQuality, pad, y + S(4), lw, rowH);
     place(g_cmbQuality, fx, y, fw, rowH + S(180));
     y += rowH + gap;
 
-    place(g_lblLang, pad, y + S(3), lw, rowH);
+    // 编码器放在画质后面：两者都是「录出来的文件长什么样」的参数，
+    // 放一块儿才好理解。窗口右栏只放录制参数，所以这里只占一行。
+    place(g_lblEncoder, pad, y + S(4), lw, rowH);
+    place(g_cmbEncoder, fx, y, fw, rowH + S(180));
+    y += rowH + gap;
+
+    // 两个独立音源开关。默认开系统声音、关麦克风；不会强制要求二选一。
+    const int audioHalf = fw / 2;
+    place(g_chkSystemAudio, fx, y, audioHalf, rowH);
+    place(g_chkMicrophone, fx + audioHalf, y, fw - audioHalf, rowH);
+    y += rowH + gap;
+
+    place(g_lblLang, pad, y + S(4), lw, rowH);
     place(g_cmbLang, fx, y, fw, rowH + S(180));
+    y += rowH + gap + S(2);
+
+    // ---- 输出目录 / 快捷键 ----
+    // 这两行把「浏览…/设置…」放到标签行右侧，编辑框就能占满整行 ——
+    // 宽度减半之后，路径框再被按钮挤掉 60px 就什么都看不见了。
+    const int smW = S(58), smH = S(22);
+    place(g_lblDir, pad, y, lw + S(70), S(20));
+    place(g_btnBrowse, pad + colContentW - smW, y, smW, smH);
+    y += S(24);
+    place(g_edtDir, pad, y, colContentW, rowH);
+    y += rowH + gap + S(2);
+
+    place(g_lblHotkey, pad, y, lw + S(70), S(20));
+    place(g_btnHotkey, pad + colContentW - smW, y, smW, smH);
+    y += S(24);
+    // 用 ES_READONLY 而不是禁用：禁用会变灰，看着像功能坏了
+    place(g_edtHotkey, pad, y, colContentW, rowH);
     y += rowH + gap + S(4);
 
-    place(g_lblDir, pad, y, lw, S(20));
-    y += S(22);
-    place(g_edtDir, pad, y, fw - btnW - gap, rowH);
-    place(g_btnBrowse, pad + fw - btnW, y, btnW, rowH);
-    y += rowH + gap + S(4);
+    // ---- 录制 / 悬浮窗 ----
+    const int floatW = S(76);
+    place(g_btnRecord, pad, y, colContentW - floatW - gap, S(38));
+    place(g_btnFloat, pad + colContentW - floatW, y, floatW, S(38));
+    y += S(38) + S(12);
 
-    int recW = fw - S(96) - gap;
-    place(g_btnRecord, pad, y, recW, S(38));
-    place(g_btnFloat, pad + fw - S(96), y, S(96), S(38));
-    y += S(38) + S(14);
-
-    place(g_lblHist, pad, y, W - pad * 2, S(20));
-    y += S(22);
-
-    int listH = rc.bottom - y - S(30) - pad;
-    if (listH < S(80)) listH = S(80);
-    place(g_list, pad, y, W - pad * 2, listH);
-    y += listH + S(4);
-    place(g_lblHint, pad, y, W - pad * 2, S(20));
+    // ---- 录制记录的开关（留在左栏底部，位置固定，不跟着展开状态跳来跳去）----
+    place(g_lblHist, pad, y, colContentW, S(22));
+    y += S(24);
+    const int leftNeed = y + pad;
 
     // 双保险：v6 下让下拉列表至少显示 12 项（v5 会失败，靠上面的高度兜底）
-    HWND combos[] = { g_cmbTarget, g_cmbFps, g_cmbQuality, g_cmbLang };
+    HWND combos[] = { g_cmbTarget, g_cmbFps, g_cmbQuality, g_cmbEncoder, g_cmbLang };
     for (HWND c : combos) SendMessageW(c, CB_SETMINVISIBLE, 12, 0);
+
+    // 下拉框宽度严格跟控件一致，确保列表不越过主窗口右边框；
+    // 窗口标题太长时宁可截断，也不让下拉横跨出界。
+    SendMessageW(g_cmbTarget, CB_SETDROPPEDWIDTH, fw, 0);
+
+    // ---- 右栏 ----
+    if (g_histOpen) {
+        ShowWindow(g_list, SW_SHOW);
+        ShowWindow(g_lblHint, SW_SHOW);
+        const int rightX = pad + colContentW + S(14);
+        const int rightW = W - rightX - pad;
+        const int top = S(12);
+
+        int listH = g_listH;
+        if (fromResize) {
+            int avail = rc.bottom - top - hintH - S(4) - pad;
+            if (avail >= S(80)) listH = avail;
+        }
+        if (listH < S(80)) listH = S(80);
+        g_listH = listH;
+
+        place(g_list, rightX, top, rightW, listH);
+        // 提示文案按窄宽度会折成两行，给一行的高度它就直接被切掉了
+        place(g_lblHint, rightX, top + listH + S(4), rightW, hintH);
+        SizeListColumns();
+        return (std::max)(leftNeed, top + listH + S(4) + hintH + pad);
+    }
+
+    ShowWindow(g_list, SW_HIDE);
+    ShowWindow(g_lblHint, SW_HIDE);
+    return leftNeed;
+}
+
+// 窗口外框和客户区之间的差（标题栏 + 边框），换算窗口尺寸时要用
+void GetChromeSize(int& cx, int& cy) {
+    RECT wr = {}, cr = {};
+    GetWindowRect(g_main, &wr);
+    GetClientRect(g_main, &cr);
+    cx = (wr.right - wr.left) - cr.right;
+    cy = (wr.bottom - wr.top) - cr.bottom;
+}
+
+// 收起 / 展开录制记录。
+// 展开时右栏是「额外加出来」的一块，所以宽度和高度都得跟着变：
+// 收起 = 单栏窄窗口，展开 = 左栏 + 右栏列表。
+void ToggleHistory() {
+    g_histOpen = !g_histOpen;
+    UpdateHistoryHeader();
+    g_cfg.Set("history_open", g_histOpen ? L"1" : L"0");
+    g_cfg.Save();
+
+    int chromeW = 0, chromeH = 0;
+    GetChromeSize(chromeW, chromeH);
+
+    const int need = LayoutMain(false);   // 先按新状态排一遍，拿到理想客户区尺寸
+    const int clientW = g_colW + (g_histOpen ? g_rightW : 0);
+
+    RECT wr = {};
+    GetWindowRect(g_main, &wr);
+    SetWindowPos(g_main, nullptr, wr.left, wr.top, clientW + chromeW, need + chromeH,
+                 SWP_NOZORDER | SWP_NOACTIVATE);
+    LayoutMain(true);                     // 尺寸变了，再排一次把列表撑到新高度
 }
 
 void ApplyRecordingUI(bool recording) {
-    SetWindowTextW(g_btnRecord, recording ? g_i18n.T("stop").c_str()
-                                          : g_i18n.T("start").c_str());
+    UpdateRecordButton();
     EnableWindow(g_btnRecord, TRUE);
     EnableWindow(g_cmbTarget, !recording);
     EnableWindow(g_cmbFps, !recording);
     EnableWindow(g_cmbQuality, !recording);
+    EnableWindow(g_cmbEncoder, !recording);
+    EnableWindow(g_chkSystemAudio, !recording);
+    EnableWindow(g_chkMicrophone, !recording);
     EnableWindow(g_cmbLang, !recording);
     EnableWindow(g_edtDir, !recording);
     EnableWindow(g_btnBrowse, !recording);
     EnableWindow(g_btnPick, !recording);
+    EnableWindow(g_btnPickWin, !recording);
     if (g_bar) InvalidateRect(g_bar, nullptr, TRUE);
 }
 
 void StartRecording() {
     // 保存当前设置
-    int sel = (int)SendMessageW(g_cmbTarget, CB_GETCURSEL, 0, 0);
+    const int sel = (int)SendMessageW(g_cmbTarget, CB_GETCURSEL, 0, 0);
+    const int fixed = TargetFixedCount();
+
+    RecTarget rt;
     std::wstring target = L"all";
-    if (sel > 0 && sel <= (int)g_monitors.size()) {
-        wchar_t buf[32]; swprintf(buf, 32, L"mon:%d", sel); target = buf;
-    } else if (sel == (int)g_monitors.size() + 1) {
-        target = L"region";
+    if (sel > 0 && sel < fixed) {
+        if (sel <= (int)g_monitors.size()) {
+            wchar_t buf[32]; swprintf(buf, 32, L"mon:%d", sel); target = buf;
+            rt.region = g_monitors[sel - 1];
+        } else {
+            target = L"region";
+            std::wstring rs = g_cfg.Get("region");
+            int a = 0, b = 0, c = 0, d = 0;
+            if (swscanf_s(rs.c_str(), L"%d,%d,%d,%d", &a, &b, &c, &d) != 4) {
+                MessageBoxW(g_main, g_i18n.T("err_no_region").c_str(), L"LiteCap", MB_ICONWARNING);
+                return;
+            }
+            rt.region = { a, b, a + c, b + d };
+        }
+    } else if (sel >= fixed) {
+        const int wi = sel - fixed;
+        if (wi < 0 || wi >= (int)g_targetWins.size()) return;
+        const WinItem& w = g_targetWins[wi];
+
+        // 配置里存的是标题 + 进程名，不是 hwnd —— hwnd 重启就变，存了也没用。
+        HWND hw = FindWindowByTitleAndExe(w.title, w.exe);
+        if (!hw) {
+            MessageBoxW(g_main, g_i18n.T("err_no_window").c_str(), L"LiteCap", MB_ICONWARNING);
+            return;
+        }
+        target = L"window";
+        rt.window = true;
+        rt.hwnd = hw;
+        g_cfg.Set("window_title", w.title);
+        g_cfg.Set("window_exe", w.exe);
+    } else {
+        rt.region.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        rt.region.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        rt.region.right = rt.region.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
+        rt.region.bottom = rt.region.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
     }
     g_cfg.Set("target", target);
 
@@ -585,7 +1080,21 @@ void StartRecording() {
     const char* qk[] = { "high", "medium", "low" };
     std::string quality = qk[q < 0 ? 0 : q];
     g_cfg.Set("quality", U82W(quality));
+
+    // 编码器：三项的顺序和 recorder.h 的 EncMode 一致。
+    // 这是录屏质量/兼容性的关键开关：NVENC 在 120fps 下追不上，
+    // 个别驱动上硬件编码还可能直接失败，所以必须能手动固定。
+    int e = (int)SendMessageW(g_cmbEncoder, CB_GETCURSEL, 0, 0);
+    const char* ek[] = { "auto", "hardware", "software" };
+    std::string encMode = ek[e < 0 ? 0 : e];
+    g_cfg.Set("encoder", U82W(encMode));
+    const bool systemAudio = SendMessageW(g_chkSystemAudio, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    const bool microphoneAudio = SendMessageW(g_chkMicrophone, BM_GETCHECK, 0, 0) == BST_CHECKED;
+    g_cfg.Set("audio_system", systemAudio ? L"1" : L"0");
+    g_cfg.Set("audio_microphone", microphoneAudio ? L"1" : L"0");
     g_cfg.Save();
+
+    g_rec.SetEncoderMode(encMode);
 
     // 目录
     std::wstring mk = outDir;
@@ -599,27 +1108,6 @@ void StartRecording() {
         }
     }
 
-    // 区域
-    RECT region = {};
-    if (target == L"all") {
-        region.left = GetSystemMetrics(SM_XVIRTUALSCREEN);
-        region.top = GetSystemMetrics(SM_YVIRTUALSCREEN);
-        region.right = region.left + GetSystemMetrics(SM_CXVIRTUALSCREEN);
-        region.bottom = region.top + GetSystemMetrics(SM_CYVIRTUALSCREEN);
-    } else if (target == L"region") {
-        std::wstring rs = g_cfg.Get("region");
-        int a = 0, b = 0, c = 0, d = 0;
-        if (swscanf_s(rs.c_str(), L"%d,%d,%d,%d", &a, &b, &c, &d) != 4) {
-            MessageBoxW(g_main, g_i18n.T("err_no_region").c_str(), L"LiteCap", MB_ICONWARNING);
-            return;
-        }
-        region = { a, b, a + c, b + d };
-    } else {
-        int idx = _wtoi(target.c_str() + 4);
-        if (idx < 1 || idx >(int)g_monitors.size()) idx = 1;
-        region = g_monitors[idx - 1];
-    }
-
     SYSTEMTIME st;
     GetLocalTime(&st);
     wchar_t name[128];
@@ -627,11 +1115,12 @@ void StartRecording() {
              st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
     std::wstring outPath = JoinPath(outDir, name);
 
-    if (!g_rec.Start(g_main, region, fps, quality, outPath)) {
+    if (!g_rec.Start(g_main, rt, fps, quality, outPath, systemAudio, microphoneAudio)) {
         MessageBoxW(g_main, g_i18n.T("err_start").c_str(), L"LiteCap", MB_ICONERROR);
         return;
     }
     g_barTime = L"00:00";
+    g_encShown = false;          // 新一次录制，编码器类型等第一帧再标
     ApplyRecordingUI(true);
 }
 
@@ -648,6 +1137,15 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
     case WM_REC_TICK:
         g_barTime = FormatDuration((long long)(ev->elapsed * 1000));
         if (g_bar) InvalidateRect(g_bar, nullptr, TRUE);
+        // 编码器是录制线程里异步打开的，到第一帧才有结果。顺便标出这次走的是
+        // 硬件还是软件 —— 否则"自动回退"对用户来说就是看不见的魔法。
+        // 提示放在录制按钮上而不是标题栏：窗口收窄之后标题会被截掉，看不见。
+        if (!g_encShown) {
+            g_encShown = true;
+            SetMainTitle(g_rec.LastHardware() ? g_i18n.T("enc_gpu").c_str()
+                                              : g_i18n.T("enc_cpu").c_str());
+            UpdateRecordButton();
+        }
         break;
     case WM_REC_DONE: {
         RecItem it;
@@ -660,15 +1158,27 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
         g_hist.Add(it);
         RefreshHistoryList();
         g_barTime = L"00:00";
+        g_encShown = false;
+        SetMainTitle();
         ApplyRecordingUI(false);
         break;
     }
-    case WM_REC_FAIL:
-        MessageBoxW(g_main, (g_i18n.T("failed") + L"\n" + ev->error).c_str(),
+    case WM_REC_FAIL: {
+        std::wstring reason = ev->error;
+        const wchar_t* sysFail = L"system audio capture init failed";
+        const wchar_t* micFail = L"microphone capture init failed";
+        if (reason.rfind(sysFail, 0) == 0)
+            reason = g_i18n.T("err_audio_system") + reason.substr(wcslen(sysFail));
+        else if (reason.rfind(micFail, 0) == 0)
+            reason = g_i18n.T("err_audio_microphone") + reason.substr(wcslen(micFail));
+        MessageBoxW(g_main, (g_i18n.T("failed") + L"\n" + reason).c_str(),
                     L"LiteCap", MB_ICONERROR);
         g_barTime = L"00:00";
+        g_encShown = false;
+        SetMainTitle();
         ApplyRecordingUI(false);
         break;
+    }
     }
     delete ev;
 }
@@ -753,13 +1263,25 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_SIZE:
-        LayoutMain();
+        LayoutMain(true);
         return 0;
+
+    case WM_ACTIVATE:
+        // 从别的程序切回来时顺手刷新一下窗口列表 ——
+        // 不然刚打开的记事本要等用户点「选择窗口…」才出现。
+        // 下拉正开着的时候绝不能重建内容，会把列表直接抽掉。
+        if (LOWORD(w) != WA_INACTIVE && g_cmbTarget && !g_rec.Running() &&
+            !SendMessageW(g_cmbTarget, CB_GETDROPPEDSTATE, 0, 0))
+            RefreshTargetCombo();
+        break;
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO* mmi = (MINMAXINFO*)l;
-        mmi->ptMinTrackSize.x = S(560);
-        mmi->ptMinTrackSize.y = S(560);
+        int chromeW = 0, chromeH = 0;
+        GetChromeSize(chromeW, chromeH);
+        // 最小宽度跟着展开状态走：展开时不允许拖到两栏互相压住
+        mmi->ptMinTrackSize.x = g_colW + (g_histOpen ? g_rightW : 0) + chromeW;
+        mmi->ptMinTrackSize.y = S(400);
         return 0;
     }
 
@@ -793,6 +1315,18 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        if (id == IDC_PICK_WIN && code == BN_CLICKED) {
+            // 「录制单独程序」的入口。窗口列表就挂在目标下拉的末尾，
+            // 所以这里不用另开一个对话框，刷新完直接把下拉拉下来就行。
+            RefreshTargetCombo();
+            SendMessageW(g_cmbTarget, CB_SHOWDROPDOWN, TRUE, 0);
+            SetFocus(g_cmbTarget);
+            return 0;
+        }
+        if (id == IDC_HIST_TOGGLE && code == BN_CLICKED) {
+            ToggleHistory();
+            return 0;
+        }
         if (id == IDC_BROWSE && code == BN_CLICKED) {
             BROWSEINFOW bi = {};
             bi.hwndOwner = h;
@@ -806,6 +1340,27 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             }
             return 0;
         }
+        if (id == IDC_HOTKEY_SET && code == BN_CLICKED) {
+            // 录制新组合前必须先把已注册的摘掉：否则按下旧组合会直接触发录制，
+            // 录制窗口根本收不到那个按键。
+            UnregisterHotKey(h, kHotkeyId);
+            UINT mod = g_hotkeyMod, vk = g_hotkeyVk;
+            if (PickHotkey(h, mod, vk)) {
+                g_hotkeyMod = mod;
+                g_hotkeyVk  = vk;
+                g_cfg.Set("hotkey_mod", std::to_wstring(g_hotkeyMod));
+                g_cfg.Set("hotkey_vk",  std::to_wstring(g_hotkeyVk));
+                g_cfg.Save();
+                if (!RegisterAppHotkey()) {
+                    MessageBoxW(h, g_i18n.T("hotkey_fail").c_str(), L"LiteCap",
+                                MB_ICONWARNING);
+                }
+                UpdateHotkeyText();
+            } else {
+                RegisterAppHotkey();   // 用户取消，把原来的装回去
+            }
+            return 0;
+        }
         if (id == IDC_LANG && code == CBN_SELCHANGE) {
             int sel = (int)SendMessageW(g_cmbLang, CB_GETCURSEL, 0, 0);
             const auto& langs = g_i18n.Languages();
@@ -814,7 +1369,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 g_cfg.Set("lang", U82W(langs[sel].code));
                 g_cfg.Save();
                 Retranslate();
-                LayoutMain();
+                LayoutMain(true);
             }
             return 0;
         }
@@ -825,11 +1380,44 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
             g_cfg.Save();
             return 0;
         }
+        if (id == IDC_ENCODER && code == CBN_SELCHANGE) {
+            // 编码器选择在选中时立即保存，不用等用户先录一段才生效。
+            // 这样退出再打开仍是用户刚刚选的模式。
+            int e = (int)SendMessageW(g_cmbEncoder, CB_GETCURSEL, 0, 0);
+            if (e < 0 || e > 2) e = 0;
+            const char* ek[] = { "auto", "hardware", "software" };
+            const std::string mode = ek[e];
+            g_cfg.Set("encoder", U82W(mode));
+            g_cfg.Save();
+            g_rec.SetEncoderMode(mode);
+            return 0;
+        }
+        if ((id == IDC_AUDIO_SYSTEM || id == IDC_AUDIO_MIC) && code == BN_CLICKED) {
+            const bool systemAudio = SendMessageW(g_chkSystemAudio, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            const bool microphoneAudio = SendMessageW(g_chkMicrophone, BM_GETCHECK, 0, 0) == BST_CHECKED;
+            g_cfg.Set("audio_system", systemAudio ? L"1" : L"0");
+            g_cfg.Set("audio_microphone", microphoneAudio ? L"1" : L"0");
+            g_cfg.Save();
+            return 0;
+        }
         if (id == IDC_TARGET && code == CBN_SELCHANGE) {
-            int sel = (int)SendMessageW(g_cmbTarget, CB_GETCURSEL, 0, 0);
-            if (sel == 0) g_cfg.Set("target", L"all");
-            else if (sel == (int)g_monitors.size() + 1) g_cfg.Set("target", L"region");
-            else { wchar_t b[32]; swprintf(b, 32, L"mon:%d", sel); g_cfg.Set("target", b); }
+            const int sel = (int)SendMessageW(g_cmbTarget, CB_GETCURSEL, 0, 0);
+            const int fixed = TargetFixedCount();
+            if (sel == 0) {
+                g_cfg.Set("target", L"all");
+            } else if (sel > 0 && sel < fixed) {
+                if (sel <= (int)g_monitors.size()) {
+                    wchar_t b[32]; swprintf(b, 32, L"mon:%d", sel);
+                    g_cfg.Set("target", b);
+                } else {
+                    g_cfg.Set("target", L"region");
+                }
+            } else if (sel >= fixed && sel - fixed < (int)g_targetWins.size()) {
+                const WinItem& w = g_targetWins[sel - fixed];
+                g_cfg.Set("target", L"window");
+                g_cfg.Set("window_title", w.title);
+                g_cfg.Set("window_exe", w.exe);
+            }
             g_cfg.Save();
             return 0;
         }
@@ -842,6 +1430,14 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         }
         break;
     }
+
+    case WM_HOTKEY:
+        if (w == (WPARAM)kHotkeyId) {
+            if (g_rec.Running()) StopRecording();
+            else                 StartRecording();
+            return 0;
+        }
+        break;
 
     case WM_REC_TICK:
     case WM_REC_DONE:
@@ -870,8 +1466,12 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ht.pt = cp;
                 int idx = (int)SendMessageW(g_list, LVM_HITTEST, 0, (LPARAM)&ht);
                 if (idx >= 0) {
-                    SendMessageW(g_list, LVM_SETITEMSTATE, idx,
-                                 (LPARAM)&(LVITEMW{ LVIF_STATE, idx, 0, LVIS_SELECTED, LVIS_SELECTED, nullptr }));
+                    LVITEMW st = {};
+                    st.mask = LVIF_STATE;
+                    st.iItem = idx;
+                    st.stateMask = LVIS_SELECTED;
+                    st.state = LVIS_SELECTED;
+                    SendMessageW(g_list, LVM_SETITEMSTATE, idx, (LPARAM)&st);
                     ShowListMenu(h, idx);
                 }
                 return 0;
@@ -901,6 +1501,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_DESTROY:
+        UnregisterHotKey(h, kHotkeyId);
         PostQuitMessage(0);
         return 0;
     }
@@ -933,6 +1534,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     std::wstring dir = ExeDir();
     g_cfg.Load(JoinPath(dir, L"settings.ini"));
+    // 记录区展开状态要记住：上次收起的话，下次打开还是那条窄栏
+    g_histOpen = g_cfg.GetInt("history_open", 1) != 0;
+    // 先读 exe 内置语言包（单文件分发也能正常显示），再用 lang/*.ini 覆盖
+    g_i18n.LoadBuiltin(inst);
     g_i18n.LoadDir(JoinPath(dir, L"lang"));
     g_i18n.SetLang(W2U8(g_cfg.Get("lang", L"zh-CN")));
     g_hist.Load(JoinPath(dir, L"history.tsv"));
@@ -971,7 +1576,20 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     sc.hCursor = LoadCursorW(nullptr, IDC_CROSS);
     RegisterClassExW(&sc);
 
-    int ww = S(600), wh = S(620);
+    WNDCLASSEXW hc = { sizeof(hc) };
+    hc.lpfnWndProc = HotkeyProc;
+    hc.hInstance = inst;
+    hc.lpszClassName = kHotkeyClass;
+    hc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    hc.hbrBackground = GetSysColorBrush(COLOR_BTNFACE);
+    RegisterClassExW(&hc);
+
+    // 两栏布局：左栏设置项固定宽度，右栏录制记录是展开时额外加出来的。
+    // 先给个够大的临时尺寸，等控件建完、排版函数算出真正需要的尺寸，再一次性收到刚好。
+    g_colW   = S(300);
+    g_rightW = S(320);
+    g_listH  = S(340);                // 记录列表的默认高度，之后跟着窗口走
+    int ww = g_colW + g_rightW + S(20), wh = S(820);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
     g_main = CreateWindowExW(0, kMainClass, L"LiteCap",
                              WS_OVERLAPPEDWINDOW,
@@ -989,18 +1607,29 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     g_lblTarget  = mk(L"STATIC", SS_LEFT, 0);
     g_cmbTarget  = mk(L"COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_TARGET);
     g_btnPick    = mk(L"BUTTON", BS_PUSHBUTTON, IDC_PICK);
+    g_btnPickWin = mk(L"BUTTON", BS_PUSHBUTTON, IDC_PICK_WIN);
     g_lblFps     = mk(L"STATIC", SS_LEFT, 0);
     g_cmbFps     = mk(L"COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_FPS);
     g_lblQuality = mk(L"STATIC", SS_LEFT, 0);
     g_cmbQuality = mk(L"COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_QUALITY);
+    g_lblEncoder = mk(L"STATIC", SS_LEFT, 0);
+    g_cmbEncoder = mk(L"COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_ENCODER);
+    g_chkSystemAudio = mk(L"BUTTON", BS_AUTOCHECKBOX | BS_LEFT, IDC_AUDIO_SYSTEM);
+    g_chkMicrophone = mk(L"BUTTON", BS_AUTOCHECKBOX | BS_LEFT, IDC_AUDIO_MIC);
     g_lblLang    = mk(L"STATIC", SS_LEFT, 0);
     g_cmbLang    = mk(L"COMBOBOX", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_LANG);
     g_lblDir     = mk(L"STATIC", SS_LEFT, 0);
     g_edtDir     = mk(L"EDIT", ES_AUTOHSCROLL | WS_BORDER, IDC_DIR);
     g_btnBrowse  = mk(L"BUTTON", BS_PUSHBUTTON, IDC_BROWSE);
+    g_lblHotkey  = mk(L"STATIC", SS_LEFT, 0);
+    g_edtHotkey  = mk(L"EDIT", ES_AUTOHSCROLL | ES_READONLY | WS_BORDER,
+                      IDC_HOTKEY_EDIT);
+    g_btnHotkey  = mk(L"BUTTON", BS_PUSHBUTTON, IDC_HOTKEY_SET);
     g_btnRecord  = mk(L"BUTTON", BS_PUSHBUTTON, IDC_RECORD);
     g_btnFloat   = mk(L"BUTTON", BS_PUSHBUTTON, IDC_FLOAT);
-    g_lblHist    = mk(L"STATIC", SS_LEFT, 0);
+    // 记录区标题做成扁平按钮：整行都能点，而且按下去有反馈，
+    // 比 STATIC + SS_NOTIFY 只认文字那一小块强。
+    g_lblHist    = mk(L"BUTTON", BS_LEFT | BS_FLAT, IDC_HIST_TOGGLE);
     g_lblHint    = mk(L"STATIC", SS_LEFT, 0);
 
     SendMessageW(g_btnRecord, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
@@ -1032,14 +1661,47 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
         int qi = q == L"low" ? 2 : q == L"medium" ? 1 : 0;
         SendMessageW(g_cmbQuality, CB_SETCURSEL, qi, 0);
 
+        std::wstring e = g_cfg.Get("encoder", L"auto");
+        int ei = e == L"hardware" ? 1 : e == L"software" ? 2 : 0;
+        SendMessageW(g_cmbEncoder, CB_SETCURSEL, ei, 0);
+
+        const bool systemAudio = g_cfg.GetInt("audio_system", 1) != 0;
+        const bool microphoneAudio = g_cfg.GetInt("audio_microphone", 0) != 0;
+        SendMessageW(g_chkSystemAudio, BM_SETCHECK,
+                     systemAudio ? BST_CHECKED : BST_UNCHECKED, 0);
+        SendMessageW(g_chkMicrophone, BM_SETCHECK,
+                     microphoneAudio ? BST_CHECKED : BST_UNCHECKED, 0);
+
         SetWindowTextW(g_edtDir, g_cfg.Get("output_dir", DefaultOutputDir()).c_str());
+
+        g_hotkeyMod = (UINT)g_cfg.GetInt("hotkey_mod", MOD_CONTROL | MOD_ALT);
+        g_hotkeyVk  = (UINT)g_cfg.GetInt("hotkey_vk", 'R');
     }
 
     RefreshHistoryList();
 
-    LayoutMain();
+    // 宽度锁死（左栏 + 右栏），高度按内容算 —— 少一行留白都不留。
+    {
+        int chromeW = 0, chromeH = 0;
+        GetChromeSize(chromeW, chromeH);
+        const int need = LayoutMain(false);
+        const int clientW = g_colW + (g_histOpen ? g_rightW : 0);
+        RECT wr = {};
+        GetWindowRect(g_main, &wr);
+        SetWindowPos(g_main, nullptr, wr.left, wr.top,
+                     clientW + chromeW, need + chromeH,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutMain(false);
+    }
+
     ShowWindow(g_main, SW_SHOW);
     UpdateWindow(g_main);
+
+    // 全局热键要等主窗口显示之后再注册，否则失败提示框会弹在窗口后面
+    if (!RegisterAppHotkey() && g_hotkeyVk) {
+        MessageBoxW(g_main, g_i18n.T("hotkey_fail").c_str(), L"LiteCap", MB_ICONWARNING);
+    }
+    UpdateHotkeyText();
 
     MSG msg;
     while (GetMessageW(&msg, nullptr, 0, 0)) {

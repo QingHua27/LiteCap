@@ -76,16 +76,6 @@ std::wstring FormatBytes(long long bytes) {
     return buf;
 }
 
-std::wstring FormatDateTime(long long epochSec) {
-    time_t t = (time_t)epochSec;
-    tm tmv = {};
-    localtime_s(&tmv, &t);
-    wchar_t buf[64];
-    swprintf(buf, 64, L"%04d-%02d-%02d %02d:%02d",
-             tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday, tmv.tm_hour, tmv.tm_min);
-    return buf;
-}
-
 std::wstring DefaultOutputDir() {
     if (GetDriveTypeW(L"D:\\") != DRIVE_NO_ROOT_DIR) return L"D:\\Recordings";
     wchar_t* profile = nullptr;
@@ -194,39 +184,81 @@ void Config::Set(const std::string& key, const std::wstring& value) {
 
 // ---------------- 本地化 ----------------
 
+// key=value 解析。内置资源和外置 .ini 走同一套逻辑，免得两份实现慢慢跑偏。
+static void ParseIni(const std::string& text, std::map<std::string, std::wstring>& table) {
+    for (const std::string& raw : SplitLines(text)) {
+        std::string line = Trim(raw);
+        if (line.empty() || line[0] == '#' || line[0] == ';') continue;
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        table[Trim(line.substr(0, eq))] = U82W(Trim(line.substr(eq + 1)));
+    }
+}
+
+void I18n::AddLang(const std::string& code, std::map<std::string, std::wstring> table) {
+    auto it = tables_.find(code);
+    if (it != tables_.end()) {
+        // 已存在（一般是内置的那份）：逐键覆盖，没提到的键保留原值。
+        // 这样用户只想改几行文案时，写个只含这几行的 ini 就够了。
+        for (auto& kv : table) it->second[kv.first] = kv.second;
+    } else {
+        tables_[code] = std::move(table);
+    }
+
+    const std::map<std::string, std::wstring>& t = tables_[code];
+    std::wstring disp = code == "zh-CN" ? L"简体中文"
+                      : code == "en-US" ? L"English"
+                      : t.count("_name") ? t.at("_name") : U82W(code);
+    for (Lang& l : langs_) {
+        if (l.code == code) { l.name = disp; return; }
+    }
+    langs_.push_back({ code, disp });
+}
+
+// 从 exe 自身资源里读默认语言包。
+// 没有这一步的话，单独拿走一个 exe 会满屏显示 target_all / pick_region 这种键名。
+void I18n::LoadBuiltin(HINSTANCE inst) {
+    const struct { int id; const char* code; } items[] = {
+        { IDR_LANG_ZHCN, "zh-CN" },
+        { IDR_LANG_ENUS, "en-US" },
+    };
+    for (const auto& item : items) {
+        HRSRC r = FindResourceW(inst, MAKEINTRESOURCEW(item.id), RT_RCDATA);
+        if (!r) continue;
+        DWORD n = SizeofResource(inst, r);
+        HGLOBAL g = LoadResource(inst, r);
+        if (!g || !n) continue;
+        const char* p = (const char*)LockResource(g);
+        if (!p) continue;
+        std::map<std::string, std::wstring> table;
+        ParseIni(std::string(p, n), table);
+        if (!table.empty()) AddLang(item.code, std::move(table));
+    }
+}
+
 void I18n::LoadDir(const std::wstring& dir) {
-    tables_.clear();
-    langs_.clear();
+    // 刻意不清空 tables_/langs_：内置语言要留着，外置只做覆盖和追加。
     std::wstring pattern = JoinPath(dir, L"*.ini");
     WIN32_FIND_DATAW fd = {};
     HANDLE h = FindFirstFileW(pattern.c_str(), &fd);
-    if (h == INVALID_HANDLE_VALUE) return;
-    do {
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
-        std::wstring full = JoinPath(dir, fd.cFileName);
-        std::string text;
-        if (!ReadAllText(full, text)) continue;
+    if (h != INVALID_HANDLE_VALUE) {
+        do {
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+            std::wstring full = JoinPath(dir, fd.cFileName);
+            std::string text;
+            if (!ReadAllText(full, text)) continue;
 
-        std::wstring name = fd.cFileName;
-        size_t dot = name.find_last_of(L'.');
-        std::string code = W2U8((dot == std::wstring::npos) ? name : name.substr(0, dot));
+            std::wstring name = fd.cFileName;
+            size_t dot = name.find_last_of(L'.');
+            std::string code = W2U8((dot == std::wstring::npos) ? name : name.substr(0, dot));
 
-        std::map<std::string, std::wstring> table;
-        for (const std::string& raw : SplitLines(text)) {
-            std::string line = Trim(raw);
-            if (line.empty() || line[0] == '#' || line[0] == ';') continue;
-            size_t eq = line.find('=');
-            if (eq == std::string::npos) continue;
-            table[Trim(line.substr(0, eq))] = U82W(Trim(line.substr(eq + 1)));
-        }
-        std::wstring disp = code == "zh-CN" ? L"简体中文"
-                          : code == "en-US" ? L"English"
-                          : table.count("_name") ? table["_name"] : U82W(code);
-        langs_.push_back({ code, disp });
-        tables_[code] = std::move(table);
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-
+            std::map<std::string, std::wstring> table;
+            ParseIni(text, table);
+            if (!table.empty()) AddLang(code, std::move(table));
+        } while (FindNextFileW(h, &fd));
+        FindClose(h);
+    }
+    // 无论有没有外置目录都排序，保证语言列表顺序一致
     std::sort(langs_.begin(), langs_.end(),
               [](const Lang& a, const Lang& b) { return a.code < b.code; });
     if (!tables_.count(cur_)) cur_ = tables_.empty() ? "en-US" : tables_.begin()->first;

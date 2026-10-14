@@ -1,14 +1,23 @@
 // recorder.cpp
 #include "recorder.h"
+#include "wincap.h"
 
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <mferror.h>
 #include <mmsystem.h>
+#include <audioclient.h>
+#include <mmdeviceapi.h>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
+#include <limits>
+#include <memory>
+#include <mutex>
+#include <vector>
 
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
@@ -68,6 +77,8 @@ bool ScreenCapture::Grab() {
 struct Mp4Encoder::Impl {
     IMFSinkWriter* writer = nullptr;
     DWORD          stream = 0;
+    DWORD          audioStream = 0;
+    bool           hasAudio = false;
     int            w = 0, h = 0;
     bool           began = false;
 };
@@ -76,12 +87,20 @@ template <class T> static void SafeRelease(T** p) {
     if (*p) { (*p)->Release(); *p = nullptr; }
 }
 
-bool Mp4Encoder::Open(const std::wstring& path, int w, int h, int fps, int bitrate) {
+bool Mp4Encoder::OpenInternal(const std::wstring& path, int w, int h, int fps,
+                              int bitrate, bool allowHardware, bool audio) {
     Close();
     impl_ = new Impl();
     impl_->w = w; impl_->h = h;
 
-    HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, nullptr, &impl_->writer);
+    // 打开硬件变换，让 MF 优先挑 GPU 编码器（NVENC / QSV / AMF）。
+    // 失败不致命：调用方会去掉这个属性再来一次，退回软件编码。
+    IMFAttributes* attrs = nullptr;
+    if (SUCCEEDED(MFCreateAttributes(&attrs, 2)) && attrs && allowHardware)
+        attrs->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
+
+    HRESULT hr = MFCreateSinkWriterFromURL(path.c_str(), nullptr, attrs, &impl_->writer);
+    SafeRelease(&attrs);
     if (FAILED(hr)) { Close(); return false; }
 
     IMFMediaType* outType = nullptr;
@@ -107,10 +126,60 @@ bool Mp4Encoder::Open(const std::wstring& path, int w, int h, int fps, int bitra
     if (SUCCEEDED(hr)) hr = impl_->writer->SetInputMediaType(impl_->stream, inType, nullptr);
     SafeRelease(&inType);
 
+    // 可选 AAC 音轨。WASAPI 统一转成 48kHz / 16-bit / stereo PCM，
+    // SinkWriter 再封装成 MP4 支持最广的 AAC-LC。
+    if (SUCCEEDED(hr) && audio) {
+        IMFMediaType* aout = nullptr;
+        hr = MFCreateMediaType(&aout);
+        if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(hr)) hr = aout->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 16000); // 128 kbps
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+        if (SUCCEEDED(hr)) hr = aout->SetUINT32(MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, 0x29); // AAC-LC
+        if (SUCCEEDED(hr)) hr = impl_->writer->AddStream(aout, &impl_->audioStream);
+        SafeRelease(&aout);
+
+        IMFMediaType* ain = nullptr;
+        if (SUCCEEDED(hr)) hr = MFCreateMediaType(&ain);
+        if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+        if (SUCCEEDED(hr)) hr = ain->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000);
+        if (SUCCEEDED(hr)) hr = ain->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+        if (SUCCEEDED(hr)) hr = impl_->writer->SetInputMediaType(impl_->audioStream, ain, nullptr);
+        SafeRelease(&ain);
+        if (SUCCEEDED(hr)) impl_->hasAudio = true;
+    }
+
     if (SUCCEEDED(hr)) hr = impl_->writer->BeginWriting();
     if (FAILED(hr)) { Close(); return false; }
     impl_->began = true;
     return true;
+}
+
+bool Mp4Encoder::Open(const std::wstring& path, int w, int h, int fps, int bitrate,
+                      EncMode mode, bool audio) {
+    // Auto：优先硬件编码（省 CPU），拿不到就退回软件。
+    // 硬件 MFT 不是每台机器都有，个别分辨率/码率组合也可能不支持，
+    // 所以软件这条兜底的路不能省。
+    if (mode != EncMode::Software) {
+        if (OpenInternal(path, w, h, fps, bitrate, /*allowHardware=*/true, audio)) {
+            hardware_ = true;
+            return true;
+        }
+        if (mode == EncMode::Hardware) return false;   // 强制硬件但失败
+    }
+    if (OpenInternal(path, w, h, fps, bitrate, /*allowHardware=*/false, audio)) {
+        hardware_ = false;
+        return true;
+    }
+    return false;
 }
 
 bool Mp4Encoder::WriteFrame(const BYTE* bgra, LONGLONG rtStart, LONGLONG rtDuration) {
@@ -126,10 +195,16 @@ bool Mp4Encoder::WriteFrame(const BYTE* bgra, LONGLONG rtStart, LONGLONG rtDurat
     if (FAILED(buf->Lock(&dst, &maxLen, nullptr))) { buf->Release(); return false; }
     if (maxLen < bytes) { buf->Unlock(); buf->Release(); return false; }
 
-    // MFVideoFormat_ARGB32 要求自下而上存放，抓屏缓冲区是自上而下，逐行倒序
-    const DWORD stride = (DWORD)w * 4;
-    for (int y = 0; y < h; ++y)
-        memcpy(dst + (size_t)y * stride, bgra + (size_t)(h - 1 - y) * stride, stride);
+    // 直接原样搬，不要翻转。
+    //
+    // 这里原本按「MFVideoFormat_ARGB32 是自下而上」的老经验做了一次逐行倒序，
+    // 但那条经验在这条链路上不成立：抓屏缓冲区本来就是自上而下（GDI 用负的
+    // biHeight 建 DIB，WGC 也是逐行从上往下拷），而 SinkWriter 这一侧也是按
+    // 自上而下解释 ARGB32 的 —— 再翻一次，录出来就是整幅上下颠倒。
+    //
+    // 用 FFmpeg 独立解码复核过（_test/ffmpeg_orient.py，四色块靶子）：
+    // 翻的时候解出来是「上蓝黄 / 下红绿」，正是真值「上红绿 / 下蓝黄」的垂直镜像。
+    memcpy(dst, bgra, bytes);
 
     buf->Unlock();
     buf->SetCurrentLength(bytes);
@@ -140,6 +215,32 @@ bool Mp4Encoder::WriteFrame(const BYTE* bgra, LONGLONG rtStart, LONGLONG rtDurat
     sample->SetSampleTime(rtStart);
     sample->SetSampleDuration(rtDuration);
     HRESULT hr = impl_->writer->WriteSample(impl_->stream, sample);
+    sample->Release();
+    buf->Release();
+    return SUCCEEDED(hr);
+}
+
+bool Mp4Encoder::WriteAudio(const int16_t* stereoPcm, DWORD frames,
+                            LONGLONG rtStart, LONGLONG rtDuration) {
+    if (!impl_ || !impl_->writer || !impl_->hasAudio || !stereoPcm || !frames) return false;
+    const DWORD bytes = frames * 2u * sizeof(int16_t);
+    IMFMediaBuffer* buf = nullptr;
+    if (FAILED(MFCreateMemoryBuffer(bytes, &buf))) return false;
+
+    BYTE* dst = nullptr;
+    DWORD maxLen = 0;
+    if (FAILED(buf->Lock(&dst, &maxLen, nullptr))) { buf->Release(); return false; }
+    if (maxLen < bytes) { buf->Unlock(); buf->Release(); return false; }
+    memcpy(dst, stereoPcm, bytes);
+    buf->Unlock();
+    buf->SetCurrentLength(bytes);
+
+    IMFSample* sample = nullptr;
+    if (FAILED(MFCreateSample(&sample))) { buf->Release(); return false; }
+    sample->AddBuffer(buf);
+    sample->SetSampleTime(rtStart);
+    sample->SetSampleDuration(rtDuration);
+    HRESULT hr = impl_->writer->WriteSample(impl_->audioStream, sample);
     sample->Release();
     buf->Release();
     return SUCCEEDED(hr);
@@ -156,25 +257,320 @@ void Mp4Encoder::Close() {
     impl_ = nullptr;
 }
 
+// ================= WASAPI 音频采集 =================
+
+namespace {
+
+constexpr UINT32 kAudioRate = 48000;
+constexpr UINT32 kAudioChannels = 2;
+constexpr UINT32 kAudioFramesPerWrite = 480; // 10ms @ 48kHz
+constexpr size_t kAudioRingFrames = kAudioRate * 4;
+constexpr LONGLONG kAudioLeadHns = 1000000;  // 留 100ms 给 WASAPI 把包送到队列
+
+struct AudioChunk {
+    LONGLONG qpcHns = 0;            // IAudioCaptureClient::GetBuffer 的 100ns QPC 时间戳
+    UINT32 frames = 0;
+    std::vector<int16_t> pcm;       // 48kHz / stereo / signed 16-bit
+};
+
+LONGLONG QpcNowHns() {
+    LARGE_INTEGER qpc = {}, freq = {};
+    QueryPerformanceCounter(&qpc);
+    QueryPerformanceFrequency(&freq);
+    if (!freq.QuadPart) return 0;
+    return (qpc.QuadPart / freq.QuadPart) * 10000000LL +
+           (qpc.QuadPart % freq.QuadPart) * 10000000LL / freq.QuadPart;
+}
+
+float ReadWasapiSample(const BYTE* data, UINT32 frame, UINT32 channel,
+                       UINT32 channels, UINT16 containerBits, UINT16 validBits, bool isFloat) {
+    if (!channels) return 0.0f;
+    if (channel >= channels) channel = channels - 1;
+    const size_t bytesPerSample = containerBits / 8;
+    const BYTE* p = data + ((size_t)frame * channels + channel) * bytesPerSample;
+    if (isFloat && containerBits == 32) {
+        float v = 0.0f;
+        memcpy(&v, p, sizeof(v));
+        if (!std::isfinite(v)) return 0.0f;
+        return (std::max)(-1.0f, (std::min)(1.0f, v));
+    }
+    if (containerBits == 16) {
+        int16_t v = 0; memcpy(&v, p, sizeof(v));
+        if (validBits < 16) v = (int16_t)(v >> (16 - validBits));
+        return (float)((double)v / (double)(1LL << (validBits - 1)));
+    }
+    if (containerBits == 24) {
+        int32_t v = (int32_t)p[0] | ((int32_t)p[1] << 8) | ((int32_t)p[2] << 16);
+        if (v & 0x800000) v |= (int32_t)0xFF000000;
+        if (validBits < 24) v >>= (24 - validBits);
+        return (float)((double)v / (double)(1LL << (validBits - 1)));
+    }
+    if (containerBits == 32) {
+        int32_t v = 0; memcpy(&v, p, sizeof(v));
+        if (validBits < 32) v >>= (32 - validBits);
+        return (float)((double)v / (double)(1LL << (validBits - 1)));
+    }
+    return 0.0f;
+}
+
+int16_t FloatToPcm16(float v) {
+    v = (std::max)(-1.0f, (std::min)(1.0f, v));
+    const int n = (int)std::lrint(v * (v < 0.0f ? 32768.0f : 32767.0f));
+    return (int16_t)(std::max)(-32768, (std::min)(32767, n));
+}
+
+class WasapiCapture {
+public:
+    explicit WasapiCapture(bool loopback) : loopback_(loopback) {}
+    ~WasapiCapture() { Stop(); }
+    WasapiCapture(const WasapiCapture&) = delete;
+    WasapiCapture& operator=(const WasapiCapture&) = delete;
+
+    bool Start(HRESULT& error) {
+        {
+            std::lock_guard<std::mutex> lk(mtx_);
+            ready_ = false;
+            error_ = S_OK;
+        }
+        stop_ = false;
+        thread_ = std::thread(&WasapiCapture::ThreadMain, this);
+        std::unique_lock<std::mutex> lk(mtx_);
+        if (!cv_.wait_for(lk, std::chrono::seconds(8), [&] { return ready_; })) {
+            error = HRESULT_FROM_WIN32(ERROR_TIMEOUT);
+            lk.unlock();
+            Stop();
+            return false;
+        }
+        error = error_;
+        return SUCCEEDED(error_);
+    }
+
+    void Stop() {
+        stop_ = true;
+        if (thread_.joinable()) thread_.join();
+    }
+
+    std::deque<AudioChunk> TakeChunks() {
+        std::lock_guard<std::mutex> lk(mtx_);
+        std::deque<AudioChunk> out;
+        out.swap(chunks_);
+        return out;
+    }
+
+private:
+    void SignalReady(HRESULT hr) {
+        std::lock_guard<std::mutex> lk(mtx_);
+        error_ = hr;
+        ready_ = true;
+        cv_.notify_all();
+    }
+
+    void ThreadMain() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        const bool uninit = SUCCEEDED(hr);
+        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) { SignalReady(hr); return; }
+
+        IMMDeviceEnumerator* enumerator = nullptr;
+        IMMDevice* device = nullptr;
+        IAudioClient* client = nullptr;
+        IAudioCaptureClient* capture = nullptr;
+        WAVEFORMATEX* mix = nullptr;
+        auto cleanup = [&]() {
+            if (client) client->Stop();
+            if (capture) capture->Release();
+            if (client) client->Release();
+            if (device) device->Release();
+            if (enumerator) enumerator->Release();
+            if (mix) CoTaskMemFree(mix);
+            if (uninit) CoUninitialize();
+        };
+
+        hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+                              __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+        if (SUCCEEDED(hr))
+            hr = enumerator->GetDefaultAudioEndpoint(loopback_ ? eRender : eCapture,
+                                                     eConsole, &device);
+        if (SUCCEEDED(hr))
+            hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&client);
+        if (SUCCEEDED(hr)) hr = client->GetMixFormat(&mix);
+
+        UINT16 containerBits = mix ? mix->wBitsPerSample : 0;
+        UINT16 validBits = containerBits;
+        bool isFloat = mix && mix->wFormatTag == WAVE_FORMAT_IEEE_FLOAT;
+        if (mix && mix->wFormatTag == WAVE_FORMAT_EXTENSIBLE &&
+            mix->cbSize >= sizeof(WAVEFORMATEXTENSIBLE) - sizeof(WAVEFORMATEX)) {
+            const auto* ext = (const WAVEFORMATEXTENSIBLE*)mix;
+            isFloat = ext->SubFormat.Data1 == 3;   // KSDATAFORMAT_SUBTYPE_IEEE_FLOAT
+            if (ext->Samples.wValidBitsPerSample) validBits = ext->Samples.wValidBitsPerSample;
+        }
+        if (SUCCEEDED(hr) && (!mix || mix->nSamplesPerSec == 0 || mix->nChannels == 0 ||
+            (containerBits != 16 && containerBits != 24 && containerBits != 32) ||
+            validBits == 0 || validBits > containerBits || (isFloat && containerBits != 32)))
+            hr = AUDCLNT_E_UNSUPPORTED_FORMAT;
+
+        const DWORD flags = loopback_ ? AUDCLNT_STREAMFLAGS_LOOPBACK : 0;
+        // Shared mode, 1s endpoint buffer. Polling avoids endpoint-specific event quirks
+        // (notably older Windows loopback event-callback behavior).
+        if (SUCCEEDED(hr)) hr = client->Initialize(AUDCLNT_SHAREMODE_SHARED, flags,
+                                                   10000000LL, 0, mix, nullptr);
+        if (SUCCEEDED(hr)) hr = client->GetService(__uuidof(IAudioCaptureClient), (void**)&capture);
+        if (SUCCEEDED(hr)) hr = client->Start();
+        if (FAILED(hr)) { SignalReady(hr); cleanup(); return; }
+        SignalReady(S_OK);
+
+        while (!stop_.load()) {
+            UINT32 packetFrames = 0;
+            hr = capture->GetNextPacketSize(&packetFrames);
+            if (FAILED(hr)) break;
+            if (!packetFrames) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(3));
+                continue;
+            }
+
+            BYTE* data = nullptr;
+            UINT32 frames = 0;
+            DWORD bufferFlags = 0;
+            UINT64 devicePos = 0, qpcPos = 0;
+            hr = capture->GetBuffer(&data, &frames, &bufferFlags, &devicePos, &qpcPos);
+            if (FAILED(hr)) break;
+            if (frames) {
+                AudioChunk chunk;
+                chunk.qpcHns = (bufferFlags & AUDCLNT_BUFFERFLAGS_TIMESTAMP_ERROR)
+                    ? QpcNowHns() : (LONGLONG)qpcPos;
+                chunk.frames = (UINT32)(((UINT64)frames * kAudioRate + mix->nSamplesPerSec / 2) /
+                                        mix->nSamplesPerSec);
+                if (!chunk.frames) chunk.frames = 1;
+                chunk.pcm.resize((size_t)chunk.frames * 2);
+                for (UINT32 out = 0; out < chunk.frames; ++out) {
+                    const UINT32 srcFrame = (UINT32)((UINT64)out * mix->nSamplesPerSec / kAudioRate);
+                    const UINT32 f = (std::min)(srcFrame, frames - 1);
+                    float left = 0.0f, right = 0.0f;
+                    if (!(bufferFlags & AUDCLNT_BUFFERFLAGS_SILENT) && data) {
+                        if (mix->nChannels == 1) {
+                            left = right = ReadWasapiSample(data, f, 0, mix->nChannels,
+                                                           containerBits, validBits, isFloat);
+                        } else {
+                            left = ReadWasapiSample(data, f, 0, mix->nChannels,
+                                                    containerBits, validBits, isFloat);
+                            right = ReadWasapiSample(data, f, 1, mix->nChannels,
+                                                     containerBits, validBits, isFloat);
+                        }
+                    }
+                    chunk.pcm[(size_t)out * 2] = FloatToPcm16(left);
+                    chunk.pcm[(size_t)out * 2 + 1] = FloatToPcm16(right);
+                }
+                {
+                    std::lock_guard<std::mutex> lk(mtx_);
+                    if (chunks_.size() >= 256) chunks_.pop_front();
+                    chunks_.push_back(std::move(chunk));
+                }
+            }
+            capture->ReleaseBuffer(frames);
+        }
+
+        cleanup();
+    }
+
+    bool loopback_ = false;
+    std::atomic<bool> stop_{ false };
+    std::thread thread_;
+    std::mutex mtx_;
+    std::condition_variable cv_;
+    std::deque<AudioChunk> chunks_;
+    bool ready_ = false;
+    HRESULT error_ = S_OK;
+};
+
+class AudioRing {
+public:
+    AudioRing() : pcm_(kAudioRingFrames * 2), tags_(kAudioRingFrames, (std::numeric_limits<LONGLONG>::min)()) {}
+
+    void Add(const AudioChunk& chunk, LONGLONG originHns) {
+        const LONGLONG delta = chunk.qpcHns - originHns;
+        const LONGLONG start = delta * (LONGLONG)kAudioRate / 10000000LL;
+        for (UINT32 i = 0; i < chunk.frames; ++i) {
+            const LONGLONG index = start + i;
+            const size_t slot = Slot(index);
+            tags_[slot] = index;
+            pcm_[slot * 2] = chunk.pcm[(size_t)i * 2];
+            pcm_[slot * 2 + 1] = chunk.pcm[(size_t)i * 2 + 1];
+        }
+    }
+
+    void Mix(LONGLONG start, UINT32 frames, bool add, std::vector<int16_t>& out) const {
+        out.resize((size_t)frames * 2);
+        for (UINT32 i = 0; i < frames; ++i) {
+            const LONGLONG index = start + i;
+            int left = 0, right = 0;
+            if (add) {
+                const size_t slot = Slot(index);
+                if (tags_[slot] == index) { left = pcm_[slot * 2]; right = pcm_[slot * 2 + 1]; }
+            }
+            const size_t o = (size_t)i * 2;
+            const int l0 = out[o], r0 = out[o + 1];
+            out[o] = (int16_t)(std::max)(-32768, (std::min)(32767, l0 + left));
+            out[o + 1] = (int16_t)(std::max)(-32768, (std::min)(32767, r0 + right));
+        }
+    }
+
+private:
+    static size_t Slot(LONGLONG index) {
+        const LONGLONG cap = (LONGLONG)kAudioRingFrames;
+        LONGLONG r = index % cap;
+        if (r < 0) r += cap;
+        return (size_t)r;
+    }
+    std::vector<int16_t> pcm_;
+    std::vector<LONGLONG> tags_;
+};
+
+void AddCaptureChunks(WasapiCapture* capture, AudioRing& ring, LONGLONG originHns) {
+    if (!capture) return;
+    auto chunks = capture->TakeChunks();
+    for (const AudioChunk& chunk : chunks) ring.Add(chunk, originHns);
+}
+
+bool WriteAudioUntil(Mp4Encoder& encoder, AudioRing& sysRing, AudioRing& micRing,
+                     bool hasSys, bool hasMic, LONGLONG originHns,
+                     LONGLONG endSample, LONGLONG& nextSample,
+                     std::vector<int16_t>& mix) {
+    while (nextSample < endSample) {
+        const UINT32 n = (UINT32)(std::min)((LONGLONG)kAudioFramesPerWrite, endSample - nextSample);
+        mix.assign((size_t)n * 2, 0);
+        sysRing.Mix(nextSample, n, hasSys, mix);
+        micRing.Mix(nextSample, n, hasMic, mix);
+        const LONGLONG start = nextSample * 10000000LL / kAudioRate;
+        const LONGLONG end = (nextSample + n) * 10000000LL / kAudioRate;
+        if (!encoder.WriteAudio(mix.data(), n, start, end - start)) return false;
+        nextSample += n;
+    }
+    return true;
+}
+
+} // namespace
+
 // ================= 录制线程 =================
 
-bool Recorder::Start(HWND notify, const RECT& region, int fps, const std::string& quality,
-                     const std::wstring& outPath) {
+bool Recorder::Start(HWND notify, const RecTarget& target, int fps, const std::string& quality,
+                     const std::wstring& outPath, bool systemAudio, bool microphoneAudio) {
     if (running_.load()) return false;
 
-    int w = region.right - region.left;
-    int h = region.bottom - region.top;
-    w -= w % 2;                     // H.264 要求偶数
-    h -= h % 2;
-    if (w < 16 || h < 16) return false;
+    if (target.window) {
+        if (!target.hwnd || !IsWindow(target.hwnd)) return false;
+    } else {
+        int w = target.region.right - target.region.left;
+        int h = target.region.bottom - target.region.top;
+        w -= w % 2;                     // H.264 要求偶数
+        h -= h % 2;
+        if (w < 16 || h < 16) return false;
+    }
 
-    region_.left = region.left;
-    region_.top  = region.top;
-    region_.right  = region.left + w;
-    region_.bottom = region.top + h;
+    target_ = target;
     fps_ = fps < 1 ? 1 : (fps > 120 ? 120 : fps);
     quality_ = quality;
     outPath_ = outPath;
+    systemAudio_ = systemAudio;
+    microphoneAudio_ = microphoneAudio;
     notify_ = notify;
     stop_ = false;
     running_ = true;
@@ -197,8 +593,79 @@ void Recorder::ThreadMain() {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
 
-    const int w = region_.right - region_.left;
-    const int h = region_.bottom - region_.top;
+    // 失败时把 HRESULT 一起带出去。
+    // 窗口捕获的两个典型失败对用户来说处置方式完全不同：
+    //   0x80070005  目标窗口提权了（UIPI），只能换个窗口或让 LiteCap 也提权
+    //   0x80004005  当前系统/会话不支持 WGC（老 Win10、某些远程桌面）
+    // 只说一句「初始化失败」，用户除了重试没别的可做。
+    auto fail = [&](const wchar_t* msg, HRESULT hr = S_OK) {
+        RecEvent* e = new RecEvent();
+        e->error = msg;
+        if (hr != S_OK) {
+            wchar_t buf[32];
+            swprintf(buf, 32, L"  (0x%08X)", (unsigned)hr);
+            e->error += buf;
+        }
+        PostMessageW(notify_, WM_REC_FAIL, 0, (LPARAM)e);
+        timeEndPeriod(1);
+        running_ = false;
+    };
+
+    // ---- 建捕获源 ----
+    // 两条路走的是完全不同的 API，但对外都是「Grab 一次拿一帧自上而下的 BGRA」，
+    // 所以下面的录制循环可以共用。
+    bool useWindow = target_.window;
+    fallback_ = false;
+    ScreenCapture sc;
+    WindowCapture wc;
+
+    int w = 0, h = 0;
+    if (useWindow) {
+        if (!wc.Init(target_.hwnd)) {
+            // WGC 的 CreateForWindow 只认带标题栏的窗口 —— 实测无边框的
+            // WS_POPUP 和 WS_POPUP|WS_THICKFRAME 都会被拒（E_INVALIDARG），
+            // 补上 WS_CAPTION 就正常。这是它的硬限制，不是我们的 bug。
+            //
+            // 但无边框窗口现实里很常见（无边框全屏的游戏、部分播放器），
+            // 直接报「录制失败」等于这些窗口根本录不了。所以退回 GDI 抓这块
+            // 矩形：会被遮挡是缺点，但至少录得下来，而且用户多半就是想要
+            // 这个窗口的画面。界面会标出「区域模式」，不会偷偷降级。
+            RECT wr = {};
+            GetWindowRect(target_.hwnd, &wr);
+            int rw = wr.right - wr.left;
+            int rh = wr.bottom - wr.top;
+            rw -= rw % 2;
+            rh -= rh % 2;
+            if (rw >= 16 && rh >= 16 && sc.Init(wr.left, wr.top, rw, rh)) {
+                useWindow = false;
+                fallback_ = true;
+                w = rw;
+                h = rh;
+            } else {
+                fail(L"window capture init failed", wc.LastError());
+                return;
+            }
+        } else {
+            w = wc.Width();
+            h = wc.Height();
+        }
+    } else {
+        w = target_.region.right - target_.region.left;
+        h = target_.region.bottom - target_.region.top;
+        w -= w % 2;
+        h -= h % 2;
+        if (w < 16 || h < 16) { fail(L"region too small"); return; }
+        if (!sc.Init(target_.region.left, target_.region.top, w, h)) {
+            fail(L"capture init failed");
+            return;
+        }
+    }
+    if (w < 16 || h < 16) { fail(L"capture size too small"); return; }
+
+    auto grabFrame = [&]() -> const BYTE* {
+        if (useWindow) return wc.Grab() ? wc.Bits() : nullptr;
+        return sc.Grab() ? sc.Bits() : nullptr;
+    };
 
     // 码率 = 像素率 × 每像素比特数。高帧率下相邻帧更相似，用 sqrt 衰减系数，
     // 避免 120fps 的码率相对 30fps 线性膨胀 4 倍。
@@ -207,33 +674,72 @@ void Recorder::ThreadMain() {
     const int bitrate = (int)((double)w * h * fps_ * factor);
     const LONGLONG frameDur = 10000000LL / fps_;      // 100ns 单位
 
-    ScreenCapture cap;
+    const bool useSystemAudio = systemAudio_.load();
+    const bool useMicrophone = microphoneAudio_.load();
+    std::unique_ptr<WasapiCapture> sysCapture;
+    std::unique_ptr<WasapiCapture> micCapture;
+    HRESULT audioHr = S_OK;
+    if (useSystemAudio) {
+        sysCapture.reset(new WasapiCapture(/*loopback=*/true));
+        if (!sysCapture->Start(audioHr)) {
+            fail(L"system audio capture init failed", audioHr);
+            return;
+        }
+    }
+    if (useMicrophone) {
+        micCapture.reset(new WasapiCapture(/*loopback=*/false));
+        if (!micCapture->Start(audioHr)) {
+            fail(L"microphone capture init failed", audioHr);
+            return;
+        }
+    }
+    const bool audioEnabled = useSystemAudio || useMicrophone;
+
     Mp4Encoder enc;
     RecEvent* ev = nullptr;
 
-    if (!cap.Init(region_.left, region_.top, w, h)) {
-        ev = new RecEvent(); ev->error = L"capture init failed";
-        PostMessageW(notify_, WM_REC_FAIL, 0, (LPARAM)ev);
-        timeEndPeriod(1);
-        running_ = false;
+    EncMode mode = EncMode::Auto;
+    if (encMode_ == "software")      mode = EncMode::Software;
+    else if (encMode_ == "hardware") mode = EncMode::Hardware;
+
+    // Auto 在 120fps 下强制走软件编码。
+    // 实测（1920×1080，同一段画面，各 6 秒）：
+    //   30fps  软件 29.93 / 硬件 29.92   —— 都达标
+    //   60fps  软件 59.85 / 硬件 59.91   —— 都达标
+    //   120fps 软件 119.75 / 硬件 82.38  —— 硬件明显追不上
+    // 原因不是 NVENC 慢，而是 MF 为了喂硬件编码器要插一个 CPU 上的
+    // ARGB32→NV12 色彩转换；1080p120 是每秒 2.5 亿像素，省下的 CPU 又还回去了。
+    // 等 WGC 那条路把色彩转换搬到 GPU 之后，这个阈值可以重新评估。
+    const int kHardwareMaxFps = 60;
+    if (mode == EncMode::Auto && fps_ > kHardwareMaxFps) mode = EncMode::Software;
+
+    if (!enc.Open(outPath_, w, h, fps_, bitrate, mode, audioEnabled)) {
+        fail(L"encoder open failed");
         return;
     }
-    if (!enc.Open(outPath_, w, h, fps_, bitrate)) {
-        cap.Shutdown();
-        ev = new RecEvent(); ev->error = L"encoder open failed";
-        PostMessageW(notify_, WM_REC_FAIL, 0, (LPARAM)ev);
-        timeEndPeriod(1);
-        running_ = false;
-        return;
-    }
+    hw_ = enc.Hardware();   // 记下这次走的是硬件还是软件编码
 
     const auto t0 = clock::now();
+    const LONGLONG audioOriginHns = QpcNowHns();
+    AudioRing sysRing, micRing;
+    LONGLONG nextAudioSample = 0;
+    std::vector<int16_t> audioMix;
+    bool audioWriteFailed = false;
     const double frameInterval = 1.0 / fps_;
     auto nextDue = t0;
     auto lastTick = t0;
     int frames = 0;
 
     while (!stop_.load()) {
+        // 录的那个窗口被关掉了：正常收尾。已经写好的文件仍然是完整可播的，
+        // 没必要把这一段丢掉。
+        // 回退到 GDI 之后 wc 已经关掉了，得直接看窗口还在不在。
+        if (useWindow) {
+            if (wc.TargetClosed()) break;
+        } else if (fallback_ && !IsWindow(target_.hwnd)) {
+            break;
+        }
+
         const auto now = clock::now();
         if (now < nextDue) {
             // 睡到接近下一帧时刻再让出，避免 120fps 下把 CPU 全烧在空转上
@@ -246,7 +752,8 @@ void Recorder::ThreadMain() {
         if (nextDue < now - std::chrono::microseconds((long long)(frameInterval * 1e6)))
             nextDue = now + std::chrono::microseconds((long long)(frameInterval * 1e6));
 
-        if (!cap.Grab()) continue;
+        const BYTE* px = grabFrame();
+        if (!px) continue;
 
         const double elapsed = std::chrono::duration<double>(clock::now() - t0).count();
         LONGLONG pts = (LONGLONG)(elapsed * 10000000.0);
@@ -255,21 +762,58 @@ void Recorder::ThreadMain() {
         if (pts <= lastPts) pts = lastPts + 1;
         lastPts = pts;
 
-        enc.WriteFrame(cap.Bits(), pts, frameDur);
+        enc.WriteFrame(px, pts, frameDur);
         ++frames;
+
+        if (audioEnabled) {
+            AddCaptureChunks(sysCapture.get(), sysRing, audioOriginHns);
+            AddCaptureChunks(micCapture.get(), micRing, audioOriginHns);
+            const LONGLONG elapsedHns =
+                (LONGLONG)(std::chrono::duration<double>(clock::now() - t0).count() * 10000000.0);
+            const LONGLONG safeHns = (std::max)(0LL, elapsedHns - kAudioLeadHns);
+            const LONGLONG audioEnd = safeHns * kAudioRate / 10000000LL;
+            if (!WriteAudioUntil(enc, sysRing, micRing, useSystemAudio, useMicrophone,
+                                 audioOriginHns, audioEnd, nextAudioSample, audioMix)) {
+                audioWriteFailed = true;
+                break;
+            }
+        }
 
         if (std::chrono::duration<double>(clock::now() - lastTick).count() >= 0.25) {
             lastTick = clock::now();
             ev = new RecEvent();
             ev->frames = frames;
             ev->elapsed = std::chrono::duration<double>(clock::now() - t0).count();
+            ev->fallback = fallback_.load();
             PostMessageW(notify_, WM_REC_TICK, 0, (LPARAM)ev);
         }
     }
 
+    if (sysCapture) sysCapture->Stop();
+    if (micCapture) micCapture->Stop();
+    if (audioEnabled && !audioWriteFailed) {
+        AddCaptureChunks(sysCapture.get(), sysRing, audioOriginHns);
+        AddCaptureChunks(micCapture.get(), micRing, audioOriginHns);
+        const LONGLONG elapsedHns =
+            (LONGLONG)(std::chrono::duration<double>(clock::now() - t0).count() * 10000000.0);
+        const LONGLONG audioEnd = elapsedHns * kAudioRate / 10000000LL;
+        if (!WriteAudioUntil(enc, sysRing, micRing, useSystemAudio, useMicrophone,
+                             audioOriginHns, audioEnd, nextAudioSample, audioMix))
+            audioWriteFailed = true;
+    }
+
     enc.Close();
-    cap.Shutdown();
+    sc.Shutdown();
+    wc.Shutdown();
     timeEndPeriod(1);
+
+    if (audioWriteFailed) {
+        RecEvent* error = new RecEvent();
+        error->error = L"audio sample write failed";
+        PostMessageW(notify_, WM_REC_FAIL, 0, (LPARAM)error);
+        running_ = false;
+        return;
+    }
 
     const double elapsed = std::chrono::duration<double>(clock::now() - t0).count();
     ev = new RecEvent();

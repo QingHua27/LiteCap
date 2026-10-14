@@ -8,7 +8,7 @@
 
 | 实现            | 位置                   | 说明                                          |
 | ------------- | -------------------- | ------------------------------------------- |
-| **C++ 版**（推荐） | 仓库根目录                | 纯 Win32 + Media Foundation，单文件 340 KB，无需运行库 |
+| **C++ 版**（推荐） | 仓库根目录                | 纯 Win32 + Media Foundation，静态链接运行库，单文件约 415 KiB，无需安装 |
 | Python 版（存档）  | [`python/`](python/) | PySide6 + PyAV，源码可直接跑，打包后 84 MB             |
 
 <img src="res/app.ico" width="72" alt="LiteCap 图标">
@@ -23,15 +23,17 @@
 
 | 功能                                           | 说明                                      |
 | -------------------------------------------- | --------------------------------------- |
-| 全屏 / 指定显示器 / 自定义区域                           | 区域框选支持多显示器与负坐标                          |
+| 全屏 / 指定显示器 / 自定义区域 / 指定窗口                   | 区域框选支持多显示器与负坐标；窗口捕获不受遮挡影响，无边框窗口会显式退回区域模式 |
 | 帧率 10 / 15 / 20 / 24 / 30 / 60 / **120** fps | 实测 120fps 能跑到 **119.8fps**              |
 | 画质 高 / 中 / 低                                 | 码率随分辨率与帧率自适应，高帧率按 `sqrt` 衰减             |
+| **编码器：自动 / 硬件 / 软件**                        | 自动优先硬件并回退；也可强制 GPU 或 CPU 编码，选项会记住       |
+| **音频：系统声音 / 麦克风独立开关**                     | 默认录制系统声音、不录麦克风；两项可同时开启，设置会记住         |
 | 输出到 `D:\Recordings`                          | D 盘不存在时自动退回用户「视频」目录                     |
-| 录制记录列表                                       | 文件名 / 时长 / 大小 / 录制时间，存于 `history.tsv`   |
+| 录制记录列表                                       | 文件名 / 时长 / 大小；可收起，展开时位于右侧，存于 `history.tsv` |
 | **软件内播放**                                    | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭        |
 | **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 复制完整路径 · 从列表移除 · 删除文件 |
 | 悬浮窗模式                                        | 圆角置顶小条，随时开始/停止，实时计时，位置记忆                |
-| 中英文界面                                        | `lang/*.ini` 语言包，切换即时生效                 |
+| 中英文界面                                        | 内置语言包 + `lang/*.ini` 覆盖，切换即时生效        |
 
 <table>
 <tr>
@@ -59,13 +61,13 @@ build.bat
 
 ```bat
 rc /nologo /fo build\app.res res\app.rc
-cl /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
-   /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp build\app.res ^
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
+   /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp src\wincap.cpp build\app.res ^
    /Fo:build\ /Fe:LiteCap.exe ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
    mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
    ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib ^
-   shlwapi.lib shell32.lib winmm.lib
+   shlwapi.lib shell32.lib winmm.lib windowsapp.lib d3d11.lib dxgi.lib dwmapi.lib
 ```
 
 - `/utf-8` —— 源码含中文注释，不加会被按 GBK 解读。
@@ -78,22 +80,47 @@ cl /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
 
 </details>
 
-依赖的 DLL 全部是系统自带的：`COMCTL32 / GDI32 / KERNEL32 / MFPlat / MFPlay / MFReadWrite / SHELL32 / USER32 / ole32`。
+依赖的 DLL 全部是系统自带的：包括 `COMCTL32 / GDI32 / KERNEL32 / MFPlat / MFPlay / MFReadWrite / SHELL32 / USER32 / ole32`，以及 WGC 所需的 `d3d11 / dxgi / dwmapi / windowsapp`。
 
 ### 实现要点
 
 #### 录制管线
 
-```
-GDI BitBlt(SRCCOPY|CAPTUREBLT)  →  DIB Section (32bpp, 自上而下)
+```text
+桌面 / 显示器 / 自定义区域 ── GDI BitBlt ── DIB Section (32bpp, 自上而下) ─┐
+                                                                              ├─ 原样拷贝 BGRA
+指定窗口 ── Windows.Graphics.Capture ── D3D11 staging texture (自上而下) ──────┘
         ↓
-逐行倒序（MFVideoFormat_ARGB32 要求自下而上）
-        ↓
-IMFSinkWriter  →  H.264  →  MP4
+IMFSinkWriter  →  H.264 视频 ──────────────┐
+                                            ├─ MP4
+WASAPI loopback / microphone → 48kHz stereo PCM → AAC 音频 ─┘
 ```
 
-**必须逐行倒序**：MF 的 `MFVideoFormat_ARGB32` 是 bottom-up 存储，而 GDI DIB 用负
-`biHeight` 创建时是 top-down。不倒序画面会上下翻转。
+GDI 与 WGC 两条输入都提供自上而下的 BGRA。帧数据直接复制给 SinkWriter；逐行倒序
+会让成片上下颠倒。方向用四色块靶子录制，再由 FFmpeg 独立解码复核，避免拿同属
+Media Foundation 的内置播放器自我验证。
+
+#### 编码器选择
+
+主界面的「编码器」下拉框提供三种模式，设置保存在 `settings.ini` 的 `encoder` 键：
+
+| 选项 | 配置值 | 行为 |
+|---|---|---|
+| 自动（默认） | `auto` | 优先尝试硬件编码；无法启动时回退软件。超过 60fps 自动走软件，避免硬件编码跟不上 |
+| 硬件编码 | `hardware` | 强制尝试 GPU 编码；失败时报告错误，不静默回退 |
+| 软件编码 | `software` | 强制使用 CPU 编码，适用于硬件 MFT 不稳定或需要复现对照时 |
+
+录制按钮会显示本次实际使用的「GPU 编码」或「CPU 编码」，所以自动模式是否成功启用硬件一眼可见。
+
+#### 音频来源
+
+主界面可独立勾选「录制系统声音」和「录制麦克风」，两项都可以同时开或同时关：
+
+- 默认值：系统声音开启、麦克风关闭。
+- 系统声音使用 WASAPI loopback 采集默认播放设备；麦克风使用 WASAPI 默认录音输入设备。
+- 选择会立即写入 `settings.ini`（`audio_system=1|0`、`audio_microphone=1|0`），下次启动恢复上次状态。
+- 勾选的音源按 WASAPI 时间戳对齐并混合成一个 AAC-LC 立体声音轨（48kHz）；两项都关闭时仅录制视频。
+- 设备不可用或 Windows 隐私设置禁止麦克风时会提示错误及 HRESULT；请检查默认设备或麦克风权限。
 
 #### 帧率精度
 
@@ -145,14 +172,15 @@ MFPlay 的 `IMFPMediaPlayer::GetDuration` / `IMFPMediaItem::GetDuration`
 ├─ settings.ini         运行期配置（自动生成）
 ├─ history.tsv          录制记录（自动生成）
 ├─ lang/
-│  ├─ zh-CN.ini         简体中文
-│  └─ en-US.ini         English
+│  ├─ zh-CN.ini         简体中文（同时作为内置语言包编进 exe）
+│  └─ en-US.ini         English（同上）
 ├─ res/
 │  ├─ app.ico           程序图标（9 个尺寸，16~256）
-│  └─ app.rc            图标资源脚本
+│  └─ app.rc            图标 + 内置语言包资源脚本
 ├─ src/
 │  ├─ common.h/.cpp     字符串 / 路径 / 格式化 / 配置 / 本地化 / 图标加载
-│  ├─ recorder.h/.cpp   GDI 抓屏 + H.264 编码 + 录制线程
+│  ├─ recorder.h/.cpp   GDI / WGC 抓屏 + WASAPI 音频 + H.264/AAC 编码与录制线程
+│  ├─ wincap.h/.cpp     窗口枚举与 Windows.Graphics.Capture 实现
 │  ├─ history.h/.cpp    录制记录（TSV 持久化）
 │  ├─ player.h/.cpp     软件内播放（Media Foundation MFPlay）
 │  └─ main.cpp          主窗口 / 悬浮窗 / 区域框选 / 右键菜单
@@ -190,6 +218,8 @@ python _tools/make_icon.py --preview   # 生成 ico + 各尺寸预览图
 ```bash
 python _test/e2e.py         # 主流程：录制 → 悬浮窗 → 停止 → 双击播放 → 右键菜单
 python _test/fps_test.py    # 帧率专项，默认 120fps：选档 → 录制 → 读真实帧率
+python _test/audio_test.py  # WASAPI 默认值 / 持久化 / 系统声与麦克风 AAC 音轨
+python _test/hotkey_close_test.py # 关闭快捷键录制窗后，主窗口可操作并可退出
 python _test/fps_test.py 4  # 指定档位索引（0=10 1=15 2=20 3=24 4=30 5=60 6=120）
 python _test/combo_check.py # 检查各下拉列表展开高度
 python _test/diag.py        # 窗口诊断
@@ -224,8 +254,10 @@ $ fps_probe.exe D:\Recordings\LiteCap_20261015_043605.mp4
 
 ### 已知边界
 
-- **不录制声音。** 加系统声音需要 WASAPI 环回采集，与「极简」相冲突，留给后续版本。
-- **抓屏走 GDI。** 1080p@120fps 实测稳定；4K 高帧率受限于 `BitBlt` 带宽，建议降帧率。
+- **音频设备使用 Windows 默认端点。** 系统声音与麦克风可分别开关；想录指定麦克风，请先在 Windows 声音设置中将它设为默认输入设备。
+- **捕获后端按目标切换。** 指定窗口走 WGC，不受遮挡影响；桌面、显示器和自定义区域走 GDI。
+  个别无边框窗口不满足 `CreateForWindow` 要求时会退回 GDI 区域捕获，并在录制按钮标明「区域模式」；
+  这种回退会受遮挡影响。4K 高帧率也受限于 `BitBlt` 带宽，建议降帧率。
 - **悬浮窗会被录进画面。** 这是屏幕录制的固有性质。想录出干净画面：把悬浮窗拖到录制
   区域之外，或切回主窗口操作。
 
@@ -237,7 +269,7 @@ $ fps_probe.exe D:\Recordings\LiteCap_20261015_043605.mp4
 
 |                     | C++ 版      | Python 版                     |
 | ------------------- | ---------- | ---------------------------- |
-| 分发体积                | **340 KB** | 84 MB（PyInstaller one-file）  |
+| 分发体积                | **415 KiB** | 84 MB（PyInstaller one-file）  |
 | 运行依赖                | 无（静态链接）    | 无（已打包）                       |
 | 启动速度                | 即时         | 需解压到临时目录，较慢                  |
 | 录制记录 / 软件内播放 / 右键菜单 | ✅          | —                            |
@@ -257,12 +289,20 @@ python python/LiteCap.py --self-check
 
 ## 本地化
 
-两个实现的语言包都是「加文件即加语言」：
+语言包分两层，**外置优先**：
 
-- C++ 版：`lang/<code>.ini`，`key=value` 格式
-- Python 版：`python/lang/<code>.json`
+| 层   | 位置                                              | 作用                        |
+| --- | ----------------------------------------------- | ------------------------- |
+| 内置  | 编译进 exe（`res/app.rc` 里的 RCDATA）                  | 保证只拿到一个 exe 也能正常显示界面      |
+| 外置  | `lang/<code>.ini`（C++）/ `python/lang/<code>.json` | 覆盖内置的同名键，也可以新增语言          |
 
-`_name` 是下拉框里显示的语言名。缺失的键会依次回退到英文、再回退到键名本身，不会出现空白。
+外置文件**不需要写全**：只写想改的那几行就够了，没提到的键自动沿用内置值。
+新增语言时写个 `lang/ja-JP.ini` 丢进去，语言下拉框里立刻多一项 —— 不用重新编译。
+
+`_name` 是下拉框里显示的语言名。键的查找顺序是：当前语言 → 英文 → 键名本身，不会出现空白。
+
+> 内置这一层是必需的。发布版只给一个 exe，若文案全靠外置文件，
+> 用户下载后看到的会是 `target_all` / `pick_region` / `col_name` 这类键名，等于不可用。
 
 ---
 

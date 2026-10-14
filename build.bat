@@ -13,6 +13,22 @@ REM ---- 1) 准备 VC 编译环境 ----
 where cl.exe >nul 2>nul
 if not errorlevel 1 goto :have_env
 
+REM ---- 1c) 补齐 Windows SDK 的头文件 / 库路径 ----
+REM vcvars64.bat 是靠查注册表来确定 SDK 版本的。如果 reg.exe 被安全策略拦掉，
+REM 它就只设好 MSVC 自己的 INCLUDE/LIB，SDK 那几段全缺 —— 表现就是
+REM "fatal error C1083: 无法打开包括文件: windows.h"。
+REM 这里不依赖注册表，直接按目录名自己找一遍补上；正常机器上重复一遍也无害。
+set "SDKROOT=%ProgramFiles(x86)%\Windows Kits\10"
+set "SDKVER="
+for /d %%v in ("%SDKROOT%\Include\10.*") do set "SDKVER=%%~nxv"
+if defined SDKVER if exist "%SDKROOT%\Include\!SDKVER!\um\windows.h" (
+    set "INCLUDE=%SDKROOT%\Include\!SDKVER!\ucrt;%SDKROOT%\Include\!SDKVER!\shared;%SDKROOT%\Include\!SDKVER!\um;%SDKROOT%\Include\!SDKVER!\winrt;%SDKROOT%\Include\!SDKVER!\cppwinrt;!INCLUDE!"
+    set "LIB=%SDKROOT%\Lib\!SDKVER!\ucrt\x64;%SDKROOT%\Lib\!SDKVER!\um\x64;!LIB!"
+    echo [i] 已补上 SDK !SDKVER! 的 INCLUDE / LIB
+) else (
+    echo [!] 没找到可用的 Windows SDK 头文件目录，编译多半会失败。
+)
+
 set "VCVARS="
 
 REM 1a) 先扫常见安装路径。
@@ -94,14 +110,22 @@ REM /utf-8          = 源码含中文注释，不加会按 GBK 解读
 REM /MANIFEST:EMBED = 把 comctl32 v6 manifest 嵌进 exe。必须加，否则控件退回经典外观，
 REM                    且 CB_SETMINVISIBLE 等 v6 消息会失败（下拉列表展开后什么都看不到）
 echo [*] 正在编译 LiteCap...
-cl.exe /nologo /EHsc /std:c++17 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
+REM /std:c++20    = wincap.cpp 走 C++/WinRT。C++17 下它会拉进已废弃的
+REM                 experimental/coroutine，直接 C2338 编译失败，
+REM                 所以整个工程一起提到 C++20。
+REM                 （注释里别写尖括号，cmd 会把它们当重定向符执行）
+REM windowsapp.lib = WinRT 激活入口（没有它 CreateForWindow 之类全部 LNK2019）
+REM d3d11/dxgi     = WGC 拿到的 GPU 纹理要拷进 staging 才能读
+REM dwmapi         = 用 DWMWA_CLOAKED 过滤掉一堆隐形窗口
+cl.exe /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
     /I src ^
-    src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp %RES% ^
+    src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\main.cpp src\wincap.cpp %RES% ^
     /Fo:build\ /Fe:LiteCap.exe ^
     /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED ^
     mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ^
     ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib ^
-    shlwapi.lib shell32.lib winmm.lib
+    shlwapi.lib shell32.lib winmm.lib ^
+    windowsapp.lib d3d11.lib dxgi.lib dwmapi.lib
 
 if errorlevel 1 (
     echo.
