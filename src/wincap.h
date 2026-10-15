@@ -52,10 +52,15 @@ public:
     bool TargetClosed() const;
 
 private:
+    bool InitSession(HWND target);
+    void CloseSession();
     struct Impl;
     Impl* impl_ = nullptr;
 
     std::vector<BYTE> front_;   // 对外暴露的那一份
+    std::vector<BYTE> source_;
+    HWND rootTarget_ = nullptr;
+    ULONGLONG lastResolve_ = 0;
     int  w_ = 0, h_ = 0;
     bool inited_ = false;
     HRESULT lastError_ = S_OK;

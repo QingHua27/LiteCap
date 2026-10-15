@@ -23,7 +23,7 @@
 
 | 功能                                           | 说明                                      |
 | -------------------------------------------- | --------------------------------------- |
-| 全屏 / 指定显示器 / 自定义区域 / 指定窗口                   | 区域框选支持多显示器与负坐标；窗口捕获不受遮挡影响，无边框窗口会显式退回区域模式 |
+| 全屏 / 指定显示器 / 自定义区域 / 指定窗口                   | 框选时背景轻度压暗、选区保持原亮度；支持多显示器与负坐标；窗口捕获可跟随 Flash / CEF 游戏的全屏渲染窗口 |
 | 帧率 10 / 15 / 20 / 24 / 30 / 60 / **120** fps | 实测 120fps 能跑到 **119.8fps**              |
 | 画质 高 / 中 / 低                                 | 码率随分辨率与帧率自适应，高帧率按 `sqrt` 衰减             |
 | **编码器：自动 / 硬件 / 软件**                        | 自动优先硬件并回退；也可强制 GPU 或 CPU 编码，选项会记住       |
@@ -84,6 +84,8 @@ cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE ^
 依赖的 DLL 全部是系统自带的：包括 `COMCTL32 / GDI32 / KERNEL32 / MFPlat / MFPlay / MFReadWrite / SHELL32 / USER32 / ole32`，以及 WGC 所需的 `d3d11 / dxgi / dwmapi / windowsapp`。
 
 ### 实现要点
+
+窗口录制支持坦克风暴等 Flash / CEF 游戏切换全屏。录像尺寸在开始时确定；录制中进入/退出全屏或改变窗口大小时，按原始比例缩放到固定画布，必要时留黑边。希望以全屏分辨率输出时，可先将游戏全屏再开始录制。
 
 #### 录制管线
 
@@ -226,6 +228,17 @@ python _test/fps_test.py 4  # 指定档位索引（0=10 1=15 2=20 3=24 4=30 5=60
 python _test/combo_check.py # 检查各下拉列表展开高度
 python _test/diag.py        # 窗口诊断
 ```
+
+原生回归测试可在已初始化 MSVC x64 环境的命令提示符中编译运行（先创建 `build/`）：
+
+```bat
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src src\wincap.cpp _test\fullscreen_capture_test.cpp /Fo:build\ /Fe:build\fullscreen_capture_test.exe /link ole32.lib user32.lib gdi32.lib dwmapi.lib
+build\fullscreen_capture_test.exe
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\wincap.cpp _test\region_picker_test.cpp build\app.res /Fo:build\ /Fe:build\region_picker_test.exe /link mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib shlwapi.lib shell32.lib winmm.lib dwmapi.lib
+build\region_picker_test.exe
+```
+
+全屏测试覆盖关联渲染窗口切换、退出全屏、调整尺寸和固定输出画布；框选测试覆盖背景可见性、选区亮度、坐标、取消及 GDI 资源清理。框选测试会短暂显示测试背景。
 
 `_probe/fps_probe.cpp` 编译后可直接读 MP4：
 

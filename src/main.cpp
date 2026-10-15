@@ -118,6 +118,11 @@ struct SelState {
     HWND  wnd = nullptr;
     HDC   memDC = nullptr;
     HBITMAP bmp = nullptr;
+    HGDIOBJ oldBmp = nullptr;
+    HDC paintDC = nullptr;
+    HBITMAP paintBmp = nullptr;
+    HGDIOBJ oldPaintBmp = nullptr;
+    std::vector<BYTE> dimmed;
     int   vx = 0, vy = 0, vw = 0, vh = 0;   // 虚拟屏幕
     bool  dragging = false;
     POINT start = {}, cur = {};
@@ -127,14 +132,33 @@ struct SelState {
 
 SelState g_sel;
 
-void SelPaint() {
-    HDC dc = GetDC(g_sel.wnd);
-    BitBlt(dc, 0, 0, g_sel.vw, g_sel.vh, g_sel.memDC, 0, 0, SRCCOPY);
+void SelReleaseBuffers() {
+    if (g_sel.memDC && g_sel.oldBmp) SelectObject(g_sel.memDC, g_sel.oldBmp);
+    if (g_sel.paintDC && g_sel.oldPaintBmp) SelectObject(g_sel.paintDC, g_sel.oldPaintBmp);
+    if (g_sel.bmp) DeleteObject(g_sel.bmp);
+    if (g_sel.paintBmp) DeleteObject(g_sel.paintBmp);
+    if (g_sel.memDC) DeleteDC(g_sel.memDC);
+    if (g_sel.paintDC) DeleteDC(g_sel.paintDC);
+    g_sel.memDC = g_sel.paintDC = nullptr;
+    g_sel.bmp = g_sel.paintBmp = nullptr;
+    g_sel.oldBmp = g_sel.oldPaintBmp = nullptr;
+    g_sel.dimmed.clear();
+}
 
-    // 压暗整屏
+void SelPaint(HDC target) {
+    HDC dc = g_sel.paintDC;
+    if (!dc) return;
+    BITMAPINFO bmi = {};
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = g_sel.vw;
+    bmi.bmiHeader.biHeight = -g_sel.vh;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    SetDIBitsToDevice(dc, 0, 0, g_sel.vw, g_sel.vh, 0, 0, 0, g_sel.vh,
+                      g_sel.dimmed.data(), &bmi, DIB_RGB_COLORS);
+
     RECT full = { 0, 0, g_sel.vw, g_sel.vh };
-    HBRUSH dim = CreateSolidBrush(RGB(0, 0, 0));
-    // 用半透明的方式不可行于 GDI，这里改成四块遮罩留下选区
     RECT sel = {};
     if (g_sel.dragging) {
         sel.left   = (std::min)(g_sel.start.x, g_sel.cur.x);
@@ -143,16 +167,8 @@ void SelPaint() {
         sel.bottom = (std::max)(g_sel.start.y, g_sel.cur.y);
     }
     if (g_sel.dragging && sel.right > sel.left && sel.bottom > sel.top) {
-        RECT parts[4] = {
-            { full.left, full.top, full.right, sel.top },
-            { full.left, sel.bottom, full.right, full.bottom },
-            { full.left, sel.top, sel.left, sel.bottom },
-            { sel.right, sel.top, full.right, sel.bottom },
-        };
-        for (int i = 0; i < 4; ++i) {
-            if (parts[i].right > parts[i].left && parts[i].bottom > parts[i].top)
-                FillRect(dc, &parts[i], (HBRUSH)GetStockObject(GRAY_BRUSH));
-        }
+        BitBlt(dc, sel.left, sel.top, sel.right-sel.left, sel.bottom-sel.top,
+               g_sel.memDC, sel.left, sel.top, SRCCOPY);
         HBRUSH frame = CreateSolidBrush(RGB(56, 160, 255));
         FrameRect(dc, &sel, frame);
         DeleteObject(frame);
@@ -163,7 +179,6 @@ void SelPaint() {
         SetTextColor(dc, RGB(255, 255, 255));
         TextOutW(dc, sel.left + 6, (std::max)(4, (int)sel.top - 22), info, (int)wcslen(info));
     } else {
-        FillRect(dc, &full, (HBRUSH)GetStockObject(GRAY_BRUSH));
         SetBkMode(dc, TRANSPARENT);
         SetTextColor(dc, RGB(255, 255, 255));
         HFONT f = CreateFontW(S(18), 0, 0, 0, FW_SEMIBOLD, 0, 0, 0, DEFAULT_CHARSET,
@@ -174,19 +189,20 @@ void SelPaint() {
         SelectObject(dc, old);
         DeleteObject(f);
     }
-    DeleteObject(dim);
-    ReleaseDC(g_sel.wnd, dc);
+    BitBlt(target, 0, 0, g_sel.vw, g_sel.vh, dc, 0, 0, SRCCOPY);
 }
 
 LRESULT CALLBACK SelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     switch (m) {
     case WM_PAINT: {
         PAINTSTRUCT ps;
-        BeginPaint(h, &ps);
+        HDC dc = BeginPaint(h, &ps);
+        SelPaint(dc);
         EndPaint(h, &ps);
-        SelPaint();
         return 0;
     }
+    case WM_ERASEBKGND:
+        return 1;
     case WM_LBUTTONDOWN:
         g_sel.dragging = true;
         g_sel.start = g_sel.cur = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
@@ -195,11 +211,15 @@ LRESULT CALLBACK SelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
     case WM_MOUSEMOVE:
         if (g_sel.dragging) {
-            g_sel.cur = { GET_X_LPARAM(l), GET_Y_LPARAM(l) };
+            g_sel.cur = { std::clamp((int)GET_X_LPARAM(l), 0, g_sel.vw),
+                          std::clamp((int)GET_Y_LPARAM(l), 0, g_sel.vh) };
             InvalidateRect(h, nullptr, FALSE);
         }
         return 0;
     case WM_LBUTTONUP: {
+        if (!g_sel.dragging) return 0;
+        g_sel.cur = { std::clamp((int)GET_X_LPARAM(l), 0, g_sel.vw),
+                      std::clamp((int)GET_Y_LPARAM(l), 0, g_sel.vh) };
         g_sel.dragging = false;
         ReleaseCapture();
         RECT sel;
@@ -221,8 +241,7 @@ LRESULT CALLBACK SelProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (w == VK_ESCAPE) { g_sel.ok = false; DestroyWindow(h); return 0; }
         return 0;
     case WM_DESTROY:
-        if (g_sel.bmp) { DeleteObject(g_sel.bmp); g_sel.bmp = nullptr; }
-        if (g_sel.memDC) { DeleteDC(g_sel.memDC); g_sel.memDC = nullptr; }
+        SelReleaseBuffers();
         g_sel.wnd = nullptr;
         return 0;
     }
@@ -247,10 +266,28 @@ bool PickRegion(HWND owner, RECT& out) {
     bmi.bmiHeader.biCompression = BI_RGB;
     void* bits = nullptr;
     g_sel.bmp = CreateDIBSection(screen, &bmi, DIB_RGB_COLORS, &bits, nullptr, 0);
-    HGDIOBJ old = SelectObject(g_sel.memDC, g_sel.bmp);
-    BitBlt(g_sel.memDC, 0, 0, vw, vh, screen, vx, vy, SRCCOPY);
-    SelectObject(g_sel.memDC, old);
+    g_sel.paintDC = CreateCompatibleDC(screen);
+    g_sel.paintBmp = CreateCompatibleBitmap(screen, vw, vh);
+    if (!g_sel.memDC || !g_sel.bmp || !bits || !g_sel.paintDC || !g_sel.paintBmp) {
+        ReleaseDC(nullptr, screen);
+        SelReleaseBuffers();
+        return false;
+    }
+    // Keep the captured bitmap selected until picker cleanup; otherwise BitBlt
+    // reads the memory DC's original 1x1 bitmap instead of the screenshot.
+    g_sel.oldBmp = SelectObject(g_sel.memDC, g_sel.bmp);
+    g_sel.oldPaintBmp = SelectObject(g_sel.paintDC, g_sel.paintBmp);
+    bool captured = BitBlt(g_sel.memDC, 0, 0, vw, vh, screen, vx, vy, SRCCOPY | CAPTUREBLT) != FALSE;
+    GdiFlush();
     ReleaseDC(nullptr, screen);
+    if (!captured) { SelReleaseBuffers(); return false; }
+    const BYTE* pixels = static_cast<const BYTE*>(bits);
+    g_sel.dimmed.resize((size_t)vw * vh * 4);
+    for (size_t i = 0; i < g_sel.dimmed.size(); i += 4) {
+        for (int channel = 0; channel < 3; ++channel)
+            g_sel.dimmed[i + channel] = (BYTE)(pixels[i + channel] * 65 / 100);
+        g_sel.dimmed[i + 3] = 0;
+    }
 
     g_sel.vx = vx; g_sel.vy = vy; g_sel.vw = vw; g_sel.vh = vh;
     g_sel.dragging = false;
@@ -258,16 +295,19 @@ bool PickRegion(HWND owner, RECT& out) {
 
     g_sel.wnd = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, kSelClass, L"",
                                 WS_POPUP, vx, vy, vw, vh, owner, nullptr, g_inst, nullptr);
-    if (!g_sel.wnd) return false;
+    if (!g_sel.wnd) { SelReleaseBuffers(); return false; }
     ShowWindow(g_sel.wnd, SW_SHOW);
     SetForegroundWindow(g_sel.wnd);
     SetFocus(g_sel.wnd);
 
-    MSG msg;
-    while (g_sel.wnd && GetMessageW(&msg, nullptr, 0, 0)) {
+    MSG msg = {};
+    int gm = 1;
+    while (g_sel.wnd && (gm = GetMessageW(&msg, nullptr, 0, 0)) > 0) {
         TranslateMessage(&msg);
         DispatchMessageW(&msg);
     }
+    if (g_sel.wnd) DestroyWindow(g_sel.wnd);
+    if (gm == 0) PostQuitMessage((int)msg.wParam);
     if (g_sel.ok) { out = g_sel.result; return true; }
     return false;
 }

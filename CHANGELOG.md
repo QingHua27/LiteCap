@@ -2,6 +2,13 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.2] - 2026-10-15
+
+- 修复坦克风暴等 Flash / CEF 游戏进入全屏后仍捕获启动窗口的问题，跟随关联渲染窗口，退出全屏后恢复原窗口。
+- 支持录制中切换全屏和调整窗口大小；本次录像的输出尺寸保持固定，画面按比例缩放并留黑边。
+- 修复框选区域被灰白色遮罩覆盖的问题：背景轻度压暗，选区保持原亮度，拖动采用双缓冲绘制。
+- 修复框选截图位图的选择与清理，保留 Esc 取消和多显示器坐标支持。
+
 ## [1.1.1] - 2026-10-15
 
 - 快捷键支持 F8、字母、数字等单按键，无需同时按 Ctrl / Alt / Shift / Win。
@@ -61,5 +68,6 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.2]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.2
 [1.1.1]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.1
 [1.1.0]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.0

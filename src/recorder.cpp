@@ -622,14 +622,10 @@ void Recorder::ThreadMain() {
     int w = 0, h = 0;
     if (useWindow) {
         if (!wc.Init(target_.hwnd)) {
-            // WGC 的 CreateForWindow 只认带标题栏的窗口 —— 实测无边框的
-            // WS_POPUP 和 WS_POPUP|WS_THICKFRAME 都会被拒（E_INVALIDARG），
-            // 补上 WS_CAPTION 就正常。这是它的硬限制，不是我们的 bug。
-            //
-            // 但无边框窗口现实里很常见（无边框全屏的游戏、部分播放器），
-            // 直接报「录制失败」等于这些窗口根本录不了。所以退回 GDI 抓这块
-            // 矩形：会被遮挡是缺点，但至少录得下来，而且用户多半就是想要
-            // 这个窗口的画面。界面会标出「区域模式」，不会偷偷降级。
+            // Some targets or sessions reject WGC. Borderless style alone is
+            // not a restriction: supported fullscreen renderers stay on WGC.
+            // If initialization fails, explicitly fall back to this window's
+            // screen rectangle; the UI labels the occlusion-sensitive mode.
             RECT wr = {};
             GetWindowRect(target_.hwnd, &wr);
             int rw = wr.right - wr.left;

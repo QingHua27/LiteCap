@@ -64,6 +64,68 @@ bool IsCloaked(HWND h) {
     return false;
 }
 
+// CEF/Flash can detach its renderer into an untitled fullscreen window in a
+// different process. Match a live child renderer's PID AND window class, never
+// just the executable name/root PID or an accumulated list of stale PIDs.
+HWND ResolveRenderWindow(HWND root) {
+    struct Renderer { DWORD pid; std::wstring windowClass; };
+    std::vector<Renderer> renderers;
+    if (IsWindow(root)) EnumChildWindows(root, [](HWND h, LPARAM lp) -> BOOL {
+        auto& out = *reinterpret_cast<std::vector<Renderer>*>(lp);
+        DWORD pid = 0;
+        wchar_t name[256] = {};
+        GetWindowThreadProcessId(h, &pid);
+        if (pid && GetClassNameW(h, name, 256)) out.push_back({ pid, name });
+        return TRUE;
+    }, reinterpret_cast<LPARAM>(&renderers));
+    struct Search { HWND root; const std::vector<Renderer>* renderers; HWND hit; } search{ root, &renderers, nullptr };
+    EnumWindows([](HWND h, LPARAM lp) -> BOOL {
+        auto& s = *reinterpret_cast<Search*>(lp);
+        if (!IsWindowVisible(h) || IsIconic(h) || IsCloaked(h)) return TRUE;
+        if (GetWindowLongW(h, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) return TRUE;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(h, &pid);
+        bool related = h == s.root;
+        for (HWND owner = GetWindow(h, GW_OWNER); owner && !related; owner = GetWindow(owner, GW_OWNER))
+            related = owner == s.root;
+        // A separately titled sibling window is another capture target. The
+        // detached render surface has no title, but shares a live child class.
+        if (!related && GetWindowTextLengthW(h) == 0) {
+            wchar_t name[256] = {};
+            GetClassNameW(h, name, 256);
+            for (const auto& renderer : *s.renderers)
+                if (renderer.pid == pid && renderer.windowClass == name) { related = true; break; }
+        }
+        if (!related) return TRUE;
+        RECT r = {};
+        MONITORINFO mi = { sizeof(mi) };
+        if (!GetWindowRect(h, &r) || !GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mi)) return TRUE;
+        const RECT& m = mi.rcMonitor;
+        if (r.left > m.left + 2 || r.top > m.top + 2 ||
+            r.right < m.right - 2 || r.bottom < m.bottom - 2) return TRUE;
+        s.hit = h;
+        return FALSE;
+    }, reinterpret_cast<LPARAM>(&search));
+    return search.hit ? search.hit : root;
+}
+
+// The MP4 encoder has a fixed size. Fit resized/fullscreen content into that
+// canvas instead of handing it a differently sized buffer or stretching it.
+void FitFrame(const std::vector<BYTE>& source, int sw, int sh,
+              std::vector<BYTE>& output, int dw, int dh) {
+    output.assign((size_t)dw * dh * 4, 0);
+    int fw = dw, fh = (int)((long long)sh * dw / sw);
+    if (fh > dh) { fh = dh; fw = (int)((long long)sw * dh / sh); }
+    fw = (std::max)(1, fw); fh = (std::max)(1, fh);
+    const int ox = (dw - fw) / 2, oy = (dh - fh) / 2;
+    for (int y = 0; y < fh; ++y) {
+        const BYTE* row = source.data() + (size_t)((long long)y * sh / fh) * sw * 4;
+        BYTE* dst = output.data() + ((size_t)(y + oy) * dw + ox) * 4;
+        for (int x = 0; x < fw; ++x)
+            memcpy(dst + (size_t)x * 4, row + (size_t)((long long)x * sw / fw) * 4, 4);
+    }
+}
+
 struct EnumCtx {
     std::vector<WinItem>* out = nullptr;
     DWORD self = 0;
@@ -143,6 +205,7 @@ HWND FindWindowByTitleAndExe(const std::wstring& title, const std::wstring& exe)
 // 否则 Shutdown 之后还在飞的那一次回调会踩到已经释放的 D3D 对象。
 struct WgcState {
     std::mutex         mtx;
+    std::mutex         frameMtx;
     std::vector<BYTE>  latest;
     bool               hasNew = false;
     int                w = 0, h = 0;
@@ -184,8 +247,10 @@ bool CopyFrameTo(const std::shared_ptr<WgcState>& st, const Direct3D11CaptureFra
 
     // H.264 要求偶数尺寸，而 WGC 给的是窗口的真实尺寸，可能是奇数。
     // 在这里就裁掉多出来的那一行一列，后面编码器就能当普通紧凑 RGB 缓冲用。
-    const UINT ew = sd.Width  & ~1u;
-    const UINT eh = sd.Height & ~1u;
+    const auto content = frame.ContentSize();
+    if (content.Width < 2 || content.Height < 2) return false;
+    const UINT ew = (std::min)(sd.Width, (UINT)content.Width) & ~1u;
+    const UINT eh = (std::min)(sd.Height, (UINT)content.Height) & ~1u;
 
     if (!st->staging || st->sw != sd.Width || st->sh != sd.Height) {
         if (st->staging) { st->staging->Release(); st->staging = nullptr; }
@@ -229,6 +294,14 @@ WindowCapture::~WindowCapture() { Shutdown(); }
 
 bool WindowCapture::Init(HWND target) {
     Shutdown();
+    rootTarget_ = target;
+    if (!target || !IsWindow(target)) { lastError_ = E_INVALIDARG; return false; }
+    lastResolve_ = GetTickCount64();
+    return InitSession(ResolveRenderWindow(target));
+}
+
+bool WindowCapture::InitSession(HWND target) {
+    CloseSession();
     lastError_ = S_OK;
     if (!target || !IsWindow(target)) { lastError_ = E_INVALIDARG; return false; }
 
@@ -240,7 +313,7 @@ bool WindowCapture::Init(HWND target) {
     // 带上错误码，至少能分清是「窗口提权了」还是「系统不支持 WGC」。
     auto bail = [this](HRESULT hr) {
         lastError_ = hr;
-        Shutdown();
+        CloseSession();
         return false;
     };
 
@@ -289,17 +362,18 @@ bool WindowCapture::Init(HWND target) {
         auto interop = winrt::get_activation_factory<GraphicsCaptureItem,
                                                      IGraphicsCaptureItemInterop>();
         // 提权窗口会返回 E_ACCESSDENIED（0x80070005）—— 这是 UIPI 的正常限制，不是 bug。
-        // 无边框窗口会返回 E_INVALIDARG（0x80070057）：实测 CreateForWindow 只接受
-        // 带 WS_CAPTION 的窗口，WS_POPUP 和 WS_POPUP|WS_THICKFRAME 都被拒。
-        // 调用方（Recorder）会据此退回 GDI 抓那块矩形。
+        // Some targets/sessions reject CreateForWindow. A borderless style by
+        // itself does not imply failure: CEF fullscreen windows work with WGC.
         HRESULT chr = interop->CreateForWindow(target, winrt::guid_of<GraphicsCaptureItem>(),
                                                winrt::put_abi(impl_->item));
         if (FAILED(chr)) return bail(chr);
 
         const auto size = impl_->item.Size();
-        w_ = (int)(size.Width  & ~1u);
-        h_ = (int)(size.Height & ~1u);
-        if (w_ < 16 || h_ < 16) return bail(E_INVALIDARG);
+        if (size.Width < 16 || size.Height < 16) return bail(E_INVALIDARG);
+        if (!w_ || !h_) {
+            w_ = (int)(size.Width & ~1u);
+            h_ = (int)(size.Height & ~1u);
+        }
 
         impl_->pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
             impl_->device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, size);
@@ -314,19 +388,38 @@ bool WindowCapture::Init(HWND target) {
 
     auto s = impl_->st;
     impl_->pool.FrameArrived(
-        [s](Direct3D11CaptureFramePool const& sender,
-            winrt::Windows::Foundation::IInspectable const&) {
-            auto frame = sender.TryGetNextFrame();
-            if (!frame) return;
-            try { CopyFrameTo(s, frame); } catch (...) {}
+        [s, device = impl_->device, size = impl_->item.Size()](Direct3D11CaptureFramePool const& sender,
+            winrt::Windows::Foundation::IInspectable const&) mutable {
+            std::lock_guard<std::mutex> serial(s->frameMtx);
+            try {
+                auto frame = sender.TryGetNextFrame();
+                if (!frame) return;
+                const auto content = frame.ContentSize();
+                CopyFrameTo(s, frame);
+                frame.Close();
+                if (content.Width > 0 && content.Height > 0 &&
+                    (content.Width != size.Width || content.Height != size.Height)) {
+                    sender.Recreate(device, DirectXPixelFormat::B8G8R8A8UIntNormalized, 2, content);
+                    size = content;
+                }
+            } catch (...) {}
         });
 
-    impl_->session.StartCapture();
+    try { impl_->session.StartCapture(); }
+    catch (winrt::hresult_error const& e) { return bail(e.code()); }
     inited_ = true;
     return true;
 }
 
 void WindowCapture::Shutdown() {
+    CloseSession();
+    front_.clear(); source_.clear();
+    w_ = h_ = 0;
+    rootTarget_ = nullptr;
+    lastResolve_ = 0;
+}
+
+void WindowCapture::CloseSession() {
     if (!impl_) return;
 
     try {
@@ -344,24 +437,38 @@ void WindowCapture::Shutdown() {
     delete impl_;            // st 是 shared_ptr：还在飞的回调自己撑住 WgcState
     impl_ = nullptr;
 
-    front_.clear();
-    w_ = h_ = 0;
     inited_ = false;
 }
 
 bool WindowCapture::Grab() {
-    if (!impl_ || !inited_) return false;
+    if (!rootTarget_) return false;
+    const ULONGLONG now = GetTickCount64();
+    if (now - lastResolve_ >= 250) {
+        lastResolve_ = now;
+        HWND render = ResolveRenderWindow(rootTarget_);
+        if (IsWindow(render) && (!impl_ || render != impl_->target)) {
+            HWND previous = impl_ ? impl_->target : nullptr;
+            source_.clear();
+            if (!InitSession(render) && previous && IsWindow(previous)) InitSession(previous);
+        }
+    }
+    if (!impl_ || !inited_) return !front_.empty();
 
     WgcState& st = *impl_->st;
+    int sw = 0, sh = 0;
     {
         std::lock_guard<std::mutex> lk(st.mtx);
         if (st.hasNew) {
             // vector 交换是 O(1)，不用为了拿一帧去 memcpy 8MB
-            std::swap(front_, st.latest);
+            std::swap(source_, st.latest);
             st.hasNew = false;
-            w_ = st.w;
-            h_ = st.h;
+            sw = st.w;
+            sh = st.h;
         }
+    }
+    if (sw > 0 && sh > 0) {
+        if (sw == w_ && sh == h_) front_.swap(source_);
+        else FitFrame(source_, sw, sh, front_, w_, h_);
     }
     // WGC 只在画面变化时给帧，窗口静止时这里会一直返回上一帧。
     // 这是故意的：编码器需要按目标帧率匀速喂帧，重复上一帧正是想要的效果。
@@ -369,6 +476,5 @@ bool WindowCapture::Grab() {
 }
 
 bool WindowCapture::TargetClosed() const {
-    if (!impl_) return true;
-    return !IsWindow(impl_->target);
+    return !IsWindow(rootTarget_) && (!impl_ || !IsWindow(impl_->target));
 }
