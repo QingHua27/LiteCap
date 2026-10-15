@@ -656,9 +656,6 @@ LRESULT CALLBACK HotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (GetKeyState(VK_MENU)    & 0x8000) mod |= MOD_ALT;
         if ((GetKeyState(VK_LWIN) & 0x8000) ||
             (GetKeyState(VK_RWIN) & 0x8000))  mod |= MOD_WIN;
-        // 裸键会抢掉全系统的普通按键，不允许
-        if (!mod) return 0;
-
         g_hkMod = mod; g_hkKey = vk; g_hkDone = true; g_hkOk = true;
         return 0;
     }
@@ -703,7 +700,7 @@ LRESULT CALLBACK HotkeyProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     return DefWindowProcW(h, m, w, l);
 }
 
-// 模态地录一个组合键；返回 false 表示用户取消
+// 模态地录一个单键或组合键；返回 false 表示用户取消
 bool PickHotkey(HWND owner, UINT& mod, UINT& vk) {
     g_hkMod = 0; g_hkKey = 0; g_hkDone = false; g_hkOk = false;
 

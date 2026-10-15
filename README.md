@@ -33,6 +33,7 @@
 | **软件内播放**                                    | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭        |
 | **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 复制完整路径 · 从列表移除 · 删除文件 |
 | 悬浮窗模式                                        | 圆角置顶小条，随时开始/停止，实时计时，位置记忆                |
+| 自定义全局快捷键                                  | 支持 F8、字母、数字等单键及组合键，按一次开始、再按一次停止；Esc 取消设置，Backspace / Delete 清除 |
 | 中英文界面                                        | 内置语言包 + `lang/*.ini` 覆盖，切换即时生效        |
 
 <table>
@@ -220,6 +221,7 @@ python _test/e2e.py         # 主流程：录制 → 悬浮窗 → 停止 → �
 python _test/fps_test.py    # 帧率专项，默认 120fps：选档 → 录制 → 读真实帧率
 python _test/audio_test.py  # WASAPI 默认值 / 持久化 / 系统声与麦克风 AAC 音轨
 python _test/hotkey_close_test.py # 关闭快捷键录制窗后，主窗口可操作并可退出
+python _test/single_key_hotkey_test.py # 单键设置、持久化、全局注册与录制触发（独立副本）
 python _test/fps_test.py 4  # 指定档位索引（0=10 1=15 2=20 3=24 4=30 5=60 6=120）
 python _test/combo_check.py # 检查各下拉列表展开高度
 python _test/diag.py        # 窗口诊断

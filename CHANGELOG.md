@@ -2,6 +2,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.1] - 2026-10-15
+
+- 快捷键支持 F8、字母、数字等单按键，无需同时按 Ctrl / Alt / Shift / Win。
+- 保留组合键、Esc 取消、Backspace / Delete 清除，更新中英文设置提示。
+
 ## [1.1.0] - 2026-10-15
 
 首个版本。
@@ -56,4 +61,5 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.1]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.1
 [1.1.0]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.0
