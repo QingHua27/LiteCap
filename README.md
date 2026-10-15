@@ -99,7 +99,7 @@ IMFSinkWriter  →  H.264 视频 ──────────────┐
 WASAPI loopback / microphone → 48kHz stereo PCM → AAC 音频 ─┘
 ```
 
-GDI 与 WGC 两条输入都提供自上而下的 BGRA。帧数据直接复制给 SinkWriter；逐行倒序
+GDI 与 WGC 两条输入都提供自上而下的 BGRA，编码输入显式声明正步幅，让软件与硬件转换路径按相同方向读取。帧数据直接复制给 SinkWriter；逐行倒序
 会让成片上下颠倒。方向用四色块靶子录制，再由 FFmpeg 独立解码复核，避免拿同属
 Media Foundation 的内置播放器自我验证。
 
@@ -236,6 +236,8 @@ cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src src\wincap.cpp _test\fullscree
 build\fullscreen_capture_test.exe
 cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\wincap.cpp _test\region_picker_test.cpp build\app.res /Fo:build\ /Fe:build\region_picker_test.exe /link mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib shlwapi.lib shell32.lib winmm.lib dwmapi.lib
 build\region_picker_test.exe
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src src\common.cpp src\recorder.cpp src\wincap.cpp _test\encoder_orientation_fixture.cpp /Fo:build\ /Fe:build\encoder_orientation_fixture.exe /link ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib shlwapi.lib dwmapi.lib
+python _test\encoder_orientation_test.py build\encoder_orientation_fixture.exe ffmpeg.exe build\encoder-orientation
 ```
 
 全屏测试覆盖关联渲染窗口切换、退出全屏、调整尺寸和固定输出画布；框选测试覆盖背景可见性、选区亮度、坐标、取消及 GDI 资源清理。框选测试会短暂显示测试背景。

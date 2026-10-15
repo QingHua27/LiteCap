@@ -2,6 +2,11 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.3] - 2026-10-15
+
+- 修复软件编码模式下录像上下倒置：为自上而下的 BGRA 输入显式声明正步幅。
+- 新增自动 / 软件 / 硬件三种编码模式的四色块独立解码回归测试。
+
 ## [1.1.2] - 2026-10-15
 
 - 修复坦克风暴等 Flash / CEF 游戏进入全屏后仍捕获启动窗口的问题，跟随关联渲染窗口，退出全屏后恢复原窗口。
@@ -68,6 +73,7 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.3]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.3
 [1.1.2]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.2
 [1.1.1]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.1
 [1.1.0]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.0

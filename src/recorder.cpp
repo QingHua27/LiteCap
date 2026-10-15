@@ -123,6 +123,9 @@ bool Mp4Encoder::OpenInternal(const std::wstring& path, int w, int h, int fps,
     if (SUCCEEDED(hr)) hr = MFSetAttributeSize(inType, MF_MT_FRAME_SIZE, w, h);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(inType, MF_MT_FRAME_RATE, fps, 1);
     if (SUCCEEDED(hr)) hr = MFSetAttributeRatio(inType, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
+    // Both capture sources produce top-down BGRA. Explicit positive stride
+    // prevents software RGB converters from assuming a bottom-up bitmap.
+    if (SUCCEEDED(hr)) hr = inType->SetUINT32(MF_MT_DEFAULT_STRIDE, (UINT32)w * 4);
     if (SUCCEEDED(hr)) hr = impl_->writer->SetInputMediaType(impl_->stream, inType, nullptr);
     SafeRelease(&inType);
 
@@ -195,15 +198,8 @@ bool Mp4Encoder::WriteFrame(const BYTE* bgra, LONGLONG rtStart, LONGLONG rtDurat
     if (FAILED(buf->Lock(&dst, &maxLen, nullptr))) { buf->Release(); return false; }
     if (maxLen < bytes) { buf->Unlock(); buf->Release(); return false; }
 
-    // 直接原样搬，不要翻转。
-    //
-    // 这里原本按「MFVideoFormat_ARGB32 是自下而上」的老经验做了一次逐行倒序，
-    // 但那条经验在这条链路上不成立：抓屏缓冲区本来就是自上而下（GDI 用负的
-    // biHeight 建 DIB，WGC 也是逐行从上往下拷），而 SinkWriter 这一侧也是按
-    // 自上而下解释 ARGB32 的 —— 再翻一次，录出来就是整幅上下颠倒。
-    //
-    // 用 FFmpeg 独立解码复核过（_test/ffmpeg_orient.py，四色块靶子）：
-    // 翻的时候解出来是「上蓝黄 / 下红绿」，正是真值「上红绿 / 下蓝黄」的垂直镜像。
+    // Input media type explicitly declares top-down stride for both software
+    // and hardware paths. Copy the captured rows without reversing them.
     memcpy(dst, bgra, bytes);
 
     buf->Unlock();
