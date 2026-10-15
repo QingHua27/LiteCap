@@ -2,6 +2,14 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.4] - 2026-10-15
+
+- 录制记录自动移除已删除的源文件，启动时和运行中检查，清理结果保存到历史记录。
+- 支持 Ctrl 多选和 Shift 连选；右键可批量复制路径、从列表移除或删除文件，删除失败的文件保留记录。
+- 默认关闭主窗口时最小化到托盘，正在进行的录制继续运行。
+- 托盘右键提供打开、退出和“关闭动作”设置，可选择直接退出或最小化到托盘并记住选择。
+- 从托盘退出时完成正在进行的录像，并保存最后一条录制记录。
+
 ## [1.1.3] - 2026-10-15
 
 - 修复软件编码模式下录像上下倒置：为自上而下的 BGRA 输入显式声明正步幅。
@@ -73,6 +81,7 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.4]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.4
 [1.1.3]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.3
 [1.1.2]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.2
 [1.1.1]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.1

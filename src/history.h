@@ -17,6 +17,8 @@ public:
 
     void Add(const RecItem& item);          // 插到最前
     void RemoveAt(size_t index);
+    void RemovePaths(const std::vector<std::wstring>& paths);
+    std::vector<size_t> PruneMissing(); // Removed indices refer to the old list.
     void Clear();
 
     const std::vector<RecItem>& Items() const { return items_; }

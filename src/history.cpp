@@ -1,6 +1,8 @@
 // history.cpp
 #include "history.h"
 #include <cstdio>
+#include <algorithm>
+#include <unordered_set>
 
 // 存储格式：每行  epoch \t 时长ms \t 字节数 \t 完整路径
 // 用 TSV 而不是 JSON：解析零依赖，人也能直接看和改。
@@ -55,6 +57,7 @@ void History::Load(const std::wstring& path) {
         it.name = (slash == std::wstring::npos) ? it.path : it.path.substr(slash + 1);
         items_.push_back(std::move(it));
     }
+    PruneMissing();
 }
 
 void History::Save() const {
@@ -84,6 +87,28 @@ void History::RemoveAt(size_t index) {
     if (index >= items_.size()) return;
     items_.erase(items_.begin() + index);
     Save();
+}
+
+void History::RemovePaths(const std::vector<std::wstring>& paths) {
+    std::unordered_set<std::wstring> removed(paths.begin(), paths.end());
+    const auto oldSize = items_.size();
+    items_.erase(std::remove_if(items_.begin(), items_.end(), [&](const RecItem& item) {
+        return removed.contains(item.path);
+    }), items_.end());
+    if (items_.size() != oldSize) Save();
+}
+
+std::vector<size_t> History::PruneMissing() {
+    std::vector<size_t> removed;
+    for (size_t i = 0; i < items_.size(); ++i) {
+        DWORD attributes = GetFileAttributesW(items_[i].path.c_str());
+        DWORD error = attributes == INVALID_FILE_ATTRIBUTES ? GetLastError() : ERROR_SUCCESS;
+        if ((attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY)) ||
+            error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) removed.push_back(i);
+    }
+    for (auto it = removed.rbegin(); it != removed.rend(); ++it) items_.erase(items_.begin() + *it);
+    if (!removed.empty()) Save();
+    return removed;
 }
 
 void History::Clear() {

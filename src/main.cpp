@@ -45,6 +45,11 @@ enum {
 enum {
     IDM_PLAY = 4001, IDM_OPEN_DIR, IDM_COPY_PATH, IDM_REMOVE, IDM_DELETE_FILE,
 };
+enum {
+    IDM_TRAY_SHOW = 4101, IDM_TRAY_EXIT, IDM_CLOSE_TRAY, IDM_CLOSE_EXIT,
+};
+static constexpr UINT kTrayMessage = WM_APP + 100;
+static constexpr UINT_PTR kHistoryTimer = 2;
 
 // 可选帧率档位（单一来源，改这里即可全局生效）
 static const int kFpsVals[] = { 10, 15, 20, 24, 30, 60, 120 };
@@ -73,6 +78,17 @@ static History     g_hist;
 static Recorder    g_rec;
 static bool        g_floatMode = false;
 static bool        g_encShown = false;   // 本次录制是否已在标题栏标出编码器
+static bool        g_closeToTray = true;
+static bool        g_trayVisible = false;
+static bool        g_exiting = false;
+static UINT        g_taskbarCreated = 0;
+static int         g_historyBusy = 0;
+static std::vector<std::wstring> g_historyRows;
+
+struct HistoryBusyScope {
+    HistoryBusyScope() { ++g_historyBusy; }
+    ~HistoryBusyScope() { --g_historyBusy; }
+};
 
 // 录制记录是否展开。界面是两栏：左边一列设置项，右边一块录制记录。
 // 收起时右栏整块消失、窗口收窄回单栏宽度 —— 只藏控件不缩窗口的话，
@@ -595,7 +611,21 @@ void SizeListColumns() {
 }
 
 void RefreshHistoryList() {
+    std::vector<std::wstring> selected;
+    std::wstring focused;
+    std::wstring anchor;
+    int mark = ListView_GetSelectionMark(g_list);
+    if (mark >= 0 && (size_t)mark < g_historyRows.size()) anchor = g_historyRows[mark];
+    int newMark = -1;
+    const bool wasVisible = (GetWindowLongW(g_list, GWL_STYLE) & WS_VISIBLE) != 0;
+    for (int row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED); row >= 0;
+         row = ListView_GetNextItem(g_list, row, LVNI_SELECTED))
+        if ((size_t)row < g_historyRows.size()) selected.push_back(g_historyRows[row]);
+    int focus = ListView_GetNextItem(g_list, -1, LVNI_FOCUSED);
+    if (focus >= 0 && (size_t)focus < g_historyRows.size()) focused = g_historyRows[focus];
+    SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
     SendMessageW(g_list, LVM_DELETEALLITEMS, 0, 0);
+    g_historyRows.clear();
     const auto& items = g_hist.Items();
     for (size_t i = 0; i < items.size(); ++i) {
         const RecItem& it = items[i];
@@ -611,7 +641,33 @@ void RefreshHistoryList() {
         LVITEMW c2 = MakeLvItem(2, (LPWSTR)sz.c_str());
         SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&c1);
         SendMessageW(g_list, LVM_SETITEMTEXTW, row, (LPARAM)&c2);
+        g_historyRows.push_back(it.path);
+        UINT state = std::find(selected.begin(), selected.end(), it.path) != selected.end() ? LVIS_SELECTED : 0;
+        if (it.path == focused) state |= LVIS_FOCUSED;
+        if (it.path == anchor) newMark = row;
+        if (state) ListView_SetItemState(g_list, row, state, LVIS_SELECTED | LVIS_FOCUSED);
     }
+    ListView_SetSelectionMark(g_list, newMark);
+    SendMessageW(g_list, WM_SETREDRAW, TRUE, 0);
+    if (!wasVisible) ShowWindow(g_list, SW_HIDE);
+    InvalidateRect(g_list, nullptr, FALSE);
+}
+
+void PruneHistoryList() {
+    if (!g_list || g_historyBusy) return;
+    const auto removed = g_hist.PruneMissing();
+    for (auto it = removed.rbegin(); it != removed.rend(); ++it) {
+        ListView_DeleteItem(g_list, (int)*it);
+        if (*it < g_historyRows.size()) g_historyRows.erase(g_historyRows.begin() + *it);
+    }
+}
+
+std::vector<RecItem> SelectedRecordings() {
+    std::vector<RecItem> selected;
+    for (int row = ListView_GetNextItem(g_list, -1, LVNI_SELECTED); row >= 0;
+         row = ListView_GetNextItem(g_list, row, LVNI_SELECTED))
+        if ((size_t)row < g_hist.Count()) selected.push_back(g_hist.Items()[row]);
+    return selected;
 }
 
 // ---------------- 全局热键 ----------------
@@ -1208,8 +1264,8 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
             reason = g_i18n.T("err_audio_system") + reason.substr(wcslen(sysFail));
         else if (reason.rfind(micFail, 0) == 0)
             reason = g_i18n.T("err_audio_microphone") + reason.substr(wcslen(micFail));
-        MessageBoxW(g_main, (g_i18n.T("failed") + L"\n" + reason).c_str(),
-                    L"LiteCap", MB_ICONERROR);
+        if (!g_exiting) MessageBoxW(g_main, (g_i18n.T("failed") + L"\n" + reason).c_str(),
+                                   L"LiteCap", MB_ICONERROR);
         g_barTime = L"00:00";
         g_encShown = false;
         SetMainTitle();
@@ -1221,60 +1277,100 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
 }
 
 // ---- 录制记录：右键菜单 ----
-void ShowListMenu(HWND hwnd, int index) {
-    if (index < 0 || index >= (int)g_hist.Count()) return;
-    HMENU m = CreatePopupMenu();
-    AppendMenuW(m, MF_STRING, IDM_PLAY, g_i18n.T("menu_play").c_str());
-    AppendMenuW(m, MF_STRING, IDM_OPEN_DIR, g_i18n.T("menu_open_dir").c_str());
-    AppendMenuW(m, MF_STRING, IDM_COPY_PATH, g_i18n.T("menu_copy_path").c_str());
-    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
-    AppendMenuW(m, MF_STRING, IDM_REMOVE, g_i18n.T("menu_remove").c_str());
-    AppendMenuW(m, MF_STRING, IDM_DELETE_FILE, g_i18n.T("menu_delete_file").c_str());
-
-    POINT pt; GetCursorPos(&pt);
-    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                                  pt.x, pt.y, 0, hwnd, nullptr);
-    DestroyMenu(m);
-    if (!cmd) return;
-
-    const RecItem item = g_hist.Items()[index];
+void ApplyListCommand(HWND hwnd, int cmd, const std::vector<RecItem>& selected) {
+    if (selected.empty()) return;
+    HistoryBusyScope busy;
+    const RecItem& item = selected.front();
     switch (cmd) {
     case IDM_PLAY:
+        if (selected.size() != 1) break;
         if (FileExists(item.path)) Player::Open(g_inst, item.path, &g_i18n);
         else MessageBoxW(hwnd, g_i18n.T("err_missing").c_str(), L"LiteCap", MB_ICONWARNING);
         break;
     case IDM_OPEN_DIR: {
+        if (selected.size() != 1) break;
         std::wstring arg = L"/select,\"" + item.path + L"\"";
         ShellExecuteW(nullptr, L"open", L"explorer.exe", arg.c_str(), nullptr, SW_SHOWNORMAL);
         break;
     }
-    case IDM_COPY_PATH:
+    case IDM_COPY_PATH: {
+        std::wstring paths;
+        for (const auto& recording : selected) {
+            if (!paths.empty()) paths += L"\r\n";
+            paths += recording.path;
+        }
         if (OpenClipboard(hwnd)) {
-            EmptyClipboard();
-            size_t bytes = (item.path.size() + 1) * sizeof(wchar_t);
+            size_t bytes = (paths.size() + 1) * sizeof(wchar_t);
             HGLOBAL hg = GlobalAlloc(GMEM_MOVEABLE, bytes);
             if (hg) {
                 void* p = GlobalLock(hg);
-                memcpy(p, item.path.c_str(), bytes);
-                GlobalUnlock(hg);
-                SetClipboardData(CF_UNICODETEXT, hg);
+                if (p) {
+                    memcpy(p, paths.c_str(), bytes);
+                    GlobalUnlock(hg);
+                    EmptyClipboard();
+                    if (!SetClipboardData(CF_UNICODETEXT, hg)) GlobalFree(hg);
+                } else GlobalFree(hg);
             }
             CloseClipboard();
         }
         break;
-    case IDM_REMOVE:
-        g_hist.RemoveAt((size_t)index);
+    }
+    case IDM_REMOVE: {
+        std::vector<std::wstring> paths;
+        for (const auto& recording : selected) paths.push_back(recording.path);
+        g_hist.RemovePaths(paths);
         RefreshHistoryList();
         break;
-    case IDM_DELETE_FILE:
-        if (MessageBoxW(hwnd, g_i18n.T("confirm_delete").c_str(), L"LiteCap",
+    }
+    case IDM_DELETE_FILE: {
+        std::wstring confirmation = g_i18n.T("confirm_delete");
+        if (selected.size() > 1) {
+            wchar_t text[512];
+            swprintf(text, 512, g_i18n.T("confirm_delete_many").c_str(), (unsigned)selected.size());
+            confirmation = text;
+        }
+        if (MessageBoxW(hwnd, confirmation.c_str(), L"LiteCap",
                         MB_YESNO | MB_ICONWARNING) == IDYES) {
-            DeleteFileW(item.path.c_str());
-            g_hist.RemoveAt((size_t)index);
+            std::vector<std::wstring> removed;
+            unsigned failures = 0;
+            for (const auto& recording : selected) {
+                if (DeleteFileW(recording.path.c_str())) removed.push_back(recording.path);
+                else {
+                    DWORD error = GetLastError();
+                    if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) removed.push_back(recording.path);
+                    else ++failures;
+                }
+            }
+            g_hist.RemovePaths(removed);
             RefreshHistoryList();
+            if (failures) {
+                wchar_t text[512];
+                swprintf(text, 512, g_i18n.T("err_delete_files").c_str(), failures);
+                MessageBoxW(hwnd, text, L"LiteCap", MB_ICONWARNING);
+            }
         }
         break;
     }
+    }
+}
+
+void ShowListMenu(HWND hwnd, int index) {
+    if (index < 0 || index >= (int)g_hist.Count()) return;
+    HistoryBusyScope busy;
+    const auto selected = SelectedRecordings(); // Snapshot paths across nested modal loops.
+    if (selected.empty()) return;
+    HMENU m = CreatePopupMenu();
+    const UINT single = MF_STRING | (selected.size() == 1 ? 0 : MF_GRAYED);
+    AppendMenuW(m, single, IDM_PLAY, g_i18n.T("menu_play").c_str());
+    AppendMenuW(m, single, IDM_OPEN_DIR, g_i18n.T("menu_open_dir").c_str());
+    AppendMenuW(m, MF_STRING, IDM_COPY_PATH, g_i18n.T("menu_copy_path").c_str());
+    AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(m, MF_STRING, IDM_REMOVE, g_i18n.T("menu_remove").c_str());
+    AppendMenuW(m, MF_STRING, IDM_DELETE_FILE, g_i18n.T("menu_delete_file").c_str());
+    POINT pt; GetCursorPos(&pt);
+    int cmd = (int)TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, nullptr);
+    DestroyMenu(m);
+    if (cmd) ApplyListCommand(hwnd, cmd, selected);
 }
 
 // ---- 悬浮窗模式 ----
@@ -1291,10 +1387,104 @@ void ExitFloatMode() {
     BarShow(false);
 }
 
+// ---------------- 系统托盘 ----------------
+bool EnsureTrayIcon() {
+    if (g_trayVisible) return true;
+    NOTIFYICONDATAW icon = {};
+    icon.cbSize = sizeof(icon);
+    icon.hWnd = g_main;
+    icon.uID = 1;
+    icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    icon.uCallbackMessage = kTrayMessage;
+    icon.hIcon = (HICON)GetClassLongPtrW(g_main, GCLP_HICONSM);
+    if (!icon.hIcon) icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    wcscpy_s(icon.szTip, L"LiteCap");
+    if (!Shell_NotifyIconW(NIM_ADD, &icon) && !Shell_NotifyIconW(NIM_MODIFY, &icon)) return false;
+    g_trayVisible = true;
+    icon.uVersion = NOTIFYICON_VERSION_4;
+    Shell_NotifyIconW(NIM_SETVERSION, &icon);
+    return true;
+}
+
+void RemoveTrayIcon() {
+    if (!g_trayVisible) return;
+    NOTIFYICONDATAW icon = {};
+    icon.cbSize = sizeof(icon); icon.hWnd = g_main; icon.uID = 1;
+    Shell_NotifyIconW(NIM_DELETE, &icon);
+    g_trayVisible = false;
+}
+
+void ShowMainFromTray() {
+    g_floatMode = false;
+    BarShow(false);
+    ShowWindow(g_main, SW_RESTORE);
+    SetForegroundWindow(g_main);
+    PruneHistoryList();
+}
+
+void ExitApplication() {
+    if (g_exiting) return;
+    g_exiting = true;
+    g_rec.Stop();
+    // Stop joins the recording worker. Persist its queued completion before
+    // destroying the notification HWND or the finished recording is lost
+    // from history even though its MP4 has been finalized.
+    MSG event = {};
+    while (PeekMessageW(&event, g_main, WM_REC_TICK, WM_REC_FAIL, PM_REMOVE))
+        OnRecEvent(event.message, event.lParam);
+    Player::Close();
+    BarShow(false);
+    DestroyWindow(g_main);
+}
+
+void HandleTrayCommand(UINT command) {
+    switch (command) {
+    case IDM_TRAY_SHOW: ShowMainFromTray(); break;
+    case IDM_TRAY_EXIT: ExitApplication(); break;
+    case IDM_CLOSE_TRAY:
+    case IDM_CLOSE_EXIT:
+        g_closeToTray = command == IDM_CLOSE_TRAY;
+        g_cfg.Set("close_action", g_closeToTray ? L"tray" : L"exit");
+        g_cfg.Save();
+        break;
+    }
+}
+
+HMENU CreateTrayMenu() {
+    HMENU menu = CreatePopupMenu();
+    HMENU actions = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_SHOW, g_i18n.T("tray_show").c_str());
+    SetMenuDefaultItem(menu, IDM_TRAY_SHOW, FALSE);
+    AppendMenuW(actions, MF_STRING, IDM_CLOSE_TRAY, g_i18n.T("close_to_tray").c_str());
+    AppendMenuW(actions, MF_STRING, IDM_CLOSE_EXIT, g_i18n.T("close_exit").c_str());
+    CheckMenuRadioItem(actions, IDM_CLOSE_TRAY, IDM_CLOSE_EXIT,
+                       g_closeToTray ? IDM_CLOSE_TRAY : IDM_CLOSE_EXIT, MF_BYCOMMAND);
+    AppendMenuW(menu, MF_POPUP, (UINT_PTR)actions, g_i18n.T("tray_close_action").c_str());
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, IDM_TRAY_EXIT, g_i18n.T("tray_exit").c_str());
+    return menu;
+}
+
+void ShowTrayMenu() {
+    HMENU menu = CreateTrayMenu();
+    POINT point; GetCursorPos(&point);
+    SetForegroundWindow(g_main);
+    UINT command = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                                 point.x, point.y, 0, g_main, nullptr);
+    DestroyMenu(menu);
+    PostMessageW(g_main, WM_NULL, 0, 0);
+    if (command) HandleTrayCommand(command);
+}
+
 }  // namespace
 
 // ---------------- 主窗口过程 ----------------
 static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
+    if (g_taskbarCreated && m == g_taskbarCreated) {
+        g_trayVisible = false;
+        if (!g_exiting) EnsureTrayIcon();
+        return 0;
+    }
     switch (m) {
     case WM_CREATE:
         return 0;
@@ -1303,7 +1493,23 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         LayoutMain(true);
         return 0;
 
+    case WM_TIMER:
+        if (w == kHistoryTimer) {
+            PruneHistoryList();
+            if (!g_trayVisible && !g_exiting) EnsureTrayIcon();
+        }
+        return 0;
+
+    case kTrayMessage: {
+        UINT event = LOWORD(l);
+        if (event == WM_CONTEXTMENU || event == WM_RBUTTONUP) ShowTrayMenu();
+        else if (event == NIN_SELECT || event == NIN_KEYSELECT || event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK)
+            ShowMainFromTray();
+        return 0;
+    }
+
     case WM_ACTIVATE:
+        if (LOWORD(w) != WA_INACTIVE) PruneHistoryList();
         // 从别的程序切回来时顺手刷新一下窗口列表 ——
         // 不然刚打开的记事本要等用户点「选择窗口…」才出现。
         // 下拉正开着的时候绝不能重建内容，会把列表直接抽掉。
@@ -1325,6 +1531,8 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_COMMAND: {
         int id = LOWORD(w);
         int code = HIWORD(w);
+        if (id >= IDM_TRAY_SHOW && id <= IDM_CLOSE_EXIT) { HandleTrayCommand(id); return 0; }
+        if (id >= IDM_PLAY && id <= IDM_DELETE_FILE) { ApplyListCommand(h, id, SelectedRecordings()); return 0; }
         if (id == IDC_RECORD && (code == BN_CLICKED || code == 0)) {
             if (g_rec.Running()) StopRecording();
             else                 StartRecording();
@@ -1503,11 +1711,13 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
                 ht.pt = cp;
                 int idx = (int)SendMessageW(g_list, LVM_HITTEST, 0, (LPARAM)&ht);
                 if (idx >= 0) {
+                    if (!(ListView_GetItemState(g_list, idx, LVIS_SELECTED) & LVIS_SELECTED))
+                        ListView_SetItemState(g_list, -1, 0, LVIS_SELECTED | LVIS_FOCUSED);
                     LVITEMW st = {};
                     st.mask = LVIF_STATE;
                     st.iItem = idx;
-                    st.stateMask = LVIS_SELECTED;
-                    st.state = LVIS_SELECTED;
+                    st.stateMask = LVIS_SELECTED | LVIS_FOCUSED;
+                    st.state = LVIS_SELECTED | LVIS_FOCUSED;
                     SendMessageW(g_list, LVM_SETITEMSTATE, idx, (LPARAM)&st);
                     ShowListMenu(h, idx);
                 }
@@ -1531,13 +1741,26 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     }
 
     case WM_CLOSE:
-        if (g_rec.Running()) StopRecording();
-        Player::Close();
-        BarShow(false);
-        DestroyWindow(h);
+        if (g_exiting) return 0;
+        if (g_closeToTray) {
+            if (EnsureTrayIcon()) {
+                Player::Close();
+                BarShow(false);
+                g_floatMode = false;
+                ShowWindow(h, SW_HIDE);
+            } else MessageBoxW(h, g_i18n.T("err_tray").c_str(), L"LiteCap", MB_ICONWARNING);
+        } else ExitApplication();
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+    case WM_ENDSESSION:
+        if (w) ExitApplication();
         return 0;
 
     case WM_DESTROY:
+        KillTimer(h, kHistoryTimer);
+        RemoveTrayIcon();
         UnregisterHotKey(h, kHotkeyId);
         PostQuitMessage(0);
         return 0;
@@ -1571,6 +1794,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
 
     std::wstring dir = ExeDir();
     g_cfg.Load(JoinPath(dir, L"settings.ini"));
+    g_closeToTray = g_cfg.Get("close_action", L"tray") != L"exit";
+    g_taskbarCreated = RegisterWindowMessageW(L"TaskbarCreated");
     // 记录区展开状态要记住：上次收起的话，下次打开还是那条窄栏
     g_histOpen = g_cfg.GetInt("history_open", 1) != 0;
     // 先读 exe 内置语言包（单文件分发也能正常显示），再用 lang/*.ini 覆盖
@@ -1673,7 +1898,7 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     SendMessageW(g_lblHist, WM_SETFONT, (WPARAM)g_fontBold, TRUE);
 
     g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
-        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
+        WS_CHILD | WS_VISIBLE | LVS_REPORT | LVS_SHOWSELALWAYS,
         0, 0, 10, 10, g_main, (HMENU)(INT_PTR)IDC_LIST, inst, nullptr);
     SendMessageW(g_list, WM_SETFONT, (WPARAM)g_font, TRUE);
     ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
@@ -1716,6 +1941,8 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, LPWSTR, int) {
     }
 
     RefreshHistoryList();
+    SetTimer(g_main, kHistoryTimer, 2000, nullptr);
+    EnsureTrayIcon();
 
     // 宽度锁死（左栏 + 右栏），高度按内容算 —— 少一行留白都不留。
     {

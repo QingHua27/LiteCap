@@ -84,7 +84,7 @@ def main():
         exe = root / "LiteCap.exe"
         shutil.copy2(source, exe)
         config = root / "settings.ini"
-        config.write_text(f"hotkey_mod=0\nhotkey_vk=0\naudio_system=0\naudio_microphone=0\n"
+        config.write_text(f"close_action=exit\nhotkey_mod=0\nhotkey_vk=0\naudio_system=0\naudio_microphone=0\n"
                           f"target=region\nregion=0,0,160,120\nfps=10\nencoder=software\n"
                           f"output_dir={root}\n", encoding="utf-8")
         try:

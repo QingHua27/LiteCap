@@ -125,8 +125,8 @@ def main():
         closed = wait_dialog_gone()
         check("Esc 后父窗口恢复启用", parent_restored(main_hwnd, closed))
 
-        print("\n[5] 主窗口可以正常关闭并退出进程")
-        u32.PostMessageW(main_hwnd, WM_CLOSE, 0, 0)
+        print("\n[5] 主窗口可以通过托盘退出命令正常结束进程")
+        u32.PostMessageW(main_hwnd, WM_COMMAND, 4102, 0)  # IDM_TRAY_EXIT
         try:
             app.wait(timeout=6)
             exited = True
