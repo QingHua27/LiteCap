@@ -2,6 +2,12 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.5] - 2026-10-18
+
+- 修复部分全屏游戏中系统热键消息未送达时无法开始或停止录制的问题，增加按键状态检测作为兼容路径。
+- 两条热键路径统一去重，按住按键不会反复切换；设置快捷键时暂停检测，保存后等待松键再启用。
+- 新增热键消息缺失、消息乱序、按住不放、组合键和计时回绕的回归测试。
+
 ## [1.1.4] - 2026-10-15
 
 - 录制记录自动移除已删除的源文件，启动时和运行中检查，清理结果保存到历史记录。
@@ -81,6 +87,7 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.5]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.5
 [1.1.4]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.4
 [1.1.3]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.3
 [1.1.2]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.2

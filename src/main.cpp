@@ -21,6 +21,7 @@
 #include "recorder.h"
 #include "wincap.h"
 #include "history.h"
+#include "hotkey.h"
 #include "player.h"
 
 #pragma comment(lib, "comctl32.lib")
@@ -50,6 +51,7 @@ enum {
 };
 static constexpr UINT kTrayMessage = WM_APP + 100;
 static constexpr UINT_PTR kHistoryTimer = 2;
+static constexpr UINT_PTR kHotkeyPollTimer = 3;
 
 // 可选帧率档位（单一来源，改这里即可全局生效）
 static const int kFpsVals[] = { 10, 15, 20, 24, 30, 60, 120 };
@@ -673,6 +675,34 @@ std::vector<RecItem> SelectedRecordings() {
 // ---------------- 全局热键 ----------------
 static UINT g_hotkeyMod = MOD_CONTROL | MOD_ALT;
 static UINT g_hotkeyVk  = 'R';
+static bool g_hotkeyActive = false;
+static HotkeyGate g_hotkeyGate;
+
+void ToggleRecordingFromHotkey();
+
+bool HotkeyAllowed() {
+    return g_hotkeyActive && !g_exiting && IsWindowEnabled(g_main);
+}
+
+void PollAppHotkey() {
+    if (!g_hotkeyActive || !g_hotkeyVk) return;
+    UINT modifiers = 0;
+    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) modifiers |= MOD_CONTROL;
+    if (GetAsyncKeyState(VK_MENU) & 0x8000) modifiers |= MOD_ALT;
+    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) modifiers |= MOD_SHIFT;
+    if ((GetAsyncKeyState(VK_LWIN) & 0x8000) || (GetAsyncKeyState(VK_RWIN) & 0x8000)) modifiers |= MOD_WIN;
+    const UINT mask = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN;
+    if (g_hotkeyGate.Poll((GetAsyncKeyState(g_hotkeyVk) & 0x8000) != 0,
+                          modifiers == (g_hotkeyMod & mask), HotkeyAllowed(), GetTickCount()))
+        ToggleRecordingFromHotkey();
+}
+
+void UnregisterAppHotkey() {
+    g_hotkeyActive = false;
+    KillTimer(g_main, kHotkeyPollTimer);
+    UnregisterHotKey(g_main, kHotkeyId);
+    g_hotkeyGate.Reset(false);
+}
 
 // 拼成 "Ctrl+Alt+R" 这样的可读文本
 std::wstring FormatHotkey(UINT mod, UINT vk) {
@@ -716,10 +746,16 @@ void UpdateHotkeyText() {
 
 // 注册失败基本都是组合已被别的程序占了，返回 false 交给调用方提示。
 bool RegisterAppHotkey() {
-    UnregisterHotKey(g_main, kHotkeyId);
+    UnregisterAppHotkey();
     if (!g_hotkeyVk) return true;    // 空 = 用户主动清掉，不注册
-    return RegisterHotKey(g_main, kHotkeyId, g_hotkeyMod | MOD_NOREPEAT,
-                          g_hotkeyVk) != FALSE;
+    if (!RegisterHotKey(g_main, kHotkeyId, g_hotkeyMod | MOD_NOREPEAT, g_hotkeyVk)) return false;
+    g_hotkeyGate.Reset((GetAsyncKeyState(g_hotkeyVk) & 0x8000) != 0);
+    g_hotkeyActive = true;
+    if (!SetTimer(g_main, kHotkeyPollTimer, 10, nullptr)) {
+        UnregisterAppHotkey();
+        return false;
+    }
+    return true;
 }
 
 // ---------------- 快捷键录制窗口 ----------------
@@ -1223,6 +1259,11 @@ void StopRecording() {
     g_rec.Stop();
 }
 
+void ToggleRecordingFromHotkey() {
+    if (g_rec.Running()) StopRecording();
+    else StartRecording();
+}
+
 void OnRecEvent(WPARAM wp, LPARAM lp) {
     RecEvent* ev = (RecEvent*)lp;
     if (!ev) return;
@@ -1494,6 +1535,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         return 0;
 
     case WM_TIMER:
+        if (w == kHotkeyPollTimer) { PollAppHotkey(); return 0; }
         if (w == kHistoryTimer) {
             PruneHistoryList();
             if (!g_trayVisible && !g_exiting) EnsureTrayIcon();
@@ -1588,7 +1630,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         if (id == IDC_HOTKEY_SET && code == BN_CLICKED) {
             // 录制新组合前必须先把已注册的摘掉：否则按下旧组合会直接触发录制，
             // 录制窗口根本收不到那个按键。
-            UnregisterHotKey(h, kHotkeyId);
+            UnregisterAppHotkey();
             UINT mod = g_hotkeyMod, vk = g_hotkeyVk;
             if (PickHotkey(h, mod, vk)) {
                 g_hotkeyMod = mod;
@@ -1678,8 +1720,11 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
 
     case WM_HOTKEY:
         if (w == (WPARAM)kHotkeyId) {
-            if (g_rec.Running()) StopRecording();
-            else                 StartRecording();
+            const DWORD eventTick = (DWORD)GetMessageTime();
+            const UINT mask = MOD_CONTROL | MOD_ALT | MOD_SHIFT | MOD_WIN;
+            if (HIWORD(l) == g_hotkeyVk && (LOWORD(l) & mask) == (g_hotkeyMod & mask) &&
+                g_hotkeyGate.Message((GetAsyncKeyState(g_hotkeyVk) & 0x8000) != 0,
+                                     HotkeyAllowed(), eventTick)) ToggleRecordingFromHotkey();
             return 0;
         }
         break;
@@ -1761,7 +1806,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
     case WM_DESTROY:
         KillTimer(h, kHistoryTimer);
         RemoveTrayIcon();
-        UnregisterHotKey(h, kHotkeyId);
+        UnregisterAppHotkey();
         PostQuitMessage(0);
         return 0;
     }

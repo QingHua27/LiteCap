@@ -51,6 +51,8 @@ def window(pid, class_name):
 
 
 def open_dialog(main, pid):
+    wait_for(lambda: u32.IsWindowVisible(main) and u32.GetDlgItem(main, 1013),
+             "main controls are not ready")
     u32.PostMessageW(main, WM_COMMAND, 1013, u32.GetDlgItem(main, 1013))
     return wait_for(lambda: window(pid, "LiteCapHotkeyWnd"), "capture dialog missing")
 

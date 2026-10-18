@@ -33,7 +33,7 @@
 | **软件内播放**                                    | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭        |
 | **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 批量复制路径 / 移除记录 / 删除文件 |
 | 悬浮窗模式                                        | 圆角置顶小条，随时开始/停止，实时计时，位置记忆                |
-| 自定义全局快捷键                                  | 支持 F8、字母、数字等单键及组合键，按一次开始、再按一次停止；Esc 取消设置，Backspace / Delete 清除 |
+| 自定义全局快捷键                                  | 支持 F8、字母、数字等单键及组合键，按一次开始、再按一次停止；兼容部分全屏游戏的热键消息缺失；Esc 取消设置，Backspace / Delete 清除 |
 | 系统托盘                                          | 默认关闭时收进托盘；右键可退出或设置关闭动作，录制中收进托盘会继续录制 |
 | 中英文界面                                        | 内置语言包 + `lang/*.ini` 覆盖，切换即时生效        |
 
@@ -246,9 +246,15 @@ cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\commo
 build\region_picker_test.exe
 cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src src\common.cpp src\recorder.cpp src\wincap.cpp _test\encoder_orientation_fixture.cpp /Fo:build\ /Fe:build\encoder_orientation_fixture.exe /link ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib shlwapi.lib dwmapi.lib
 python _test\encoder_orientation_test.py build\encoder_orientation_fixture.exe ffmpeg.exe build\encoder-orientation
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src _test\hotkey_gate_test.cpp /Fo:build\ /Fe:build\hotkey_gate_test.exe
+build\hotkey_gate_test.exe
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\wincap.cpp _test\fullscreen_hotkey_test.cpp build\app.res /Fo:build\ /Fe:build\fullscreen_hotkey_test.exe /link mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib shlwapi.lib shell32.lib winmm.lib dwmapi.lib
+python _test\run_fullscreen_hotkey_test.py build\fullscreen_hotkey_test.exe
 ```
 
 全屏测试覆盖关联渲染窗口切换、退出全屏、调整尺寸和固定输出画布；框选测试覆盖背景可见性、选区亮度、坐标、取消及 GDI 资源清理。框选测试会短暂显示测试背景。
+
+热键回归在独立配置中屏蔽系统热键消息，验证备用检测仍可开始、保持和停止录制。英雄联盟对局请在进入游戏后选择 `League of Legends.exe` 对局窗口；`LeagueClientUx.exe` 是大厅客户端。
 
 `_probe/fps_probe.cpp` 编译后可直接读 MP4：
 
