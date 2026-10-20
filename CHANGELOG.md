@@ -2,6 +2,14 @@
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [1.1.6] - 2026-10-20
+
+- 录制记录右键新增“复制视频文件”，支持 Ctrl / Shift 多选后批量复制，保留复制路径选项。
+- 成功结束录制后自动将视频文件放入剪贴板，可直接粘贴到文件夹或支持文件粘贴的聊天软件；退出时完成的录制也支持复制。
+- 开始录制和视频保存完成时提供提示音及托盘通知，不切换前台窗口；复制失败会给出明确提示。
+- 修复录制失败后线程未回收导致重试或退出崩溃的问题；视频写入或封装失败时报告错误，保留原剪贴板内容。
+- 新增文件复制、录制反馈、剪贴板占用及编码故障回归测试。
+
 ## [1.1.5] - 2026-10-18
 
 - 修复部分全屏游戏中系统热键消息未送达时无法开始或停止录制的问题，增加按键状态检测作为兼容路径。
@@ -87,6 +95,7 @@ PySide6 + mss + PyAV + numpy 实现，源码位于 `python/`。功能与 C++ 版
 
 本程序不包含任何网络代码：没有 socket、没有 HTTP、没有更新检查、没有遥测。
 
+[1.1.6]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.6
 [1.1.5]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.5
 [1.1.4]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.4
 [1.1.3]: https://github.com/QingHua27/LiteCap/releases/tag/v1.1.3

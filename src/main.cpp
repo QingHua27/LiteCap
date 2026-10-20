@@ -44,7 +44,7 @@ enum {
     IDC_ENCODER, IDC_AUDIO_SYSTEM, IDC_AUDIO_MIC,
 };
 enum {
-    IDM_PLAY = 4001, IDM_OPEN_DIR, IDM_COPY_PATH, IDM_REMOVE, IDM_DELETE_FILE,
+    IDM_PLAY = 4001, IDM_OPEN_DIR, IDM_COPY_PATH, IDM_REMOVE, IDM_DELETE_FILE, IDM_COPY_FILES,
 };
 enum {
     IDM_TRAY_SHOW = 4101, IDM_TRAY_EXIT, IDM_CLOSE_TRAY, IDM_CLOSE_EXIT,
@@ -1151,6 +1151,8 @@ void ApplyRecordingUI(bool recording) {
     if (g_bar) InvalidateRect(g_bar, nullptr, TRUE);
 }
 
+void NotifyUser(const std::wstring& title, const std::wstring& detail, int sound = -1, bool warning = false);
+
 void StartRecording() {
     // 保存当前设置
     const int sel = (int)SendMessageW(g_cmbTarget, CB_GETCURSEL, 0, 0);
@@ -1274,11 +1276,12 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
         // 编码器是录制线程里异步打开的，到第一帧才有结果。顺便标出这次走的是
         // 硬件还是软件 —— 否则"自动回退"对用户来说就是看不见的魔法。
         // 提示放在录制按钮上而不是标题栏：窗口收窄之后标题会被截掉，看不见。
-        if (!g_encShown) {
+        if (!g_encShown && ev->frames > 0) {
             g_encShown = true;
             SetMainTitle(g_rec.LastHardware() ? g_i18n.T("enc_gpu").c_str()
                                               : g_i18n.T("enc_cpu").c_str());
             UpdateRecordButton();
+            NotifyUser(g_i18n.T("notify_started"), g_i18n.T("notify_started_body"), MB_OK);
         }
         break;
     case WM_REC_DONE: {
@@ -1291,6 +1294,10 @@ void OnRecEvent(WPARAM wp, LPARAM lp) {
         it.name = (slash == std::wstring::npos) ? it.path : it.path.substr(slash + 1);
         g_hist.Add(it);
         RefreshHistoryList();
+        const bool copied = it.bytes > 0 && CopyVideoFiles(g_main, {it.path});
+        NotifyUser(g_i18n.T("notify_finished"),
+                   it.name + L"\n" + g_i18n.T(copied ? "notify_video_copied" : "notify_video_copy_failed"),
+                   MB_ICONASTERISK, !copied);
         g_barTime = L"00:00";
         g_encShown = false;
         SetMainTitle();
@@ -1356,6 +1363,15 @@ void ApplyListCommand(HWND hwnd, int cmd, const std::vector<RecItem>& selected) 
         }
         break;
     }
+    case IDM_COPY_FILES: {
+        std::vector<std::wstring> paths;
+        for (const auto& recording : selected) paths.push_back(recording.path);
+        const bool copied = CopyVideoFiles(hwnd, paths);
+        NotifyUser(g_i18n.T(copied ? "notify_copied" : "notify_copy_failed"),
+                   g_i18n.T(copied ? "notify_files_copied" : "notify_copy_failed_body"),
+                   -1, !copied);
+        break;
+    }
     case IDM_REMOVE: {
         std::vector<std::wstring> paths;
         for (const auto& recording : selected) paths.push_back(recording.path);
@@ -1404,6 +1420,7 @@ void ShowListMenu(HWND hwnd, int index) {
     const UINT single = MF_STRING | (selected.size() == 1 ? 0 : MF_GRAYED);
     AppendMenuW(m, single, IDM_PLAY, g_i18n.T("menu_play").c_str());
     AppendMenuW(m, single, IDM_OPEN_DIR, g_i18n.T("menu_open_dir").c_str());
+    AppendMenuW(m, MF_STRING, IDM_COPY_FILES, g_i18n.T("menu_copy_files").c_str());
     AppendMenuW(m, MF_STRING, IDM_COPY_PATH, g_i18n.T("menu_copy_path").c_str());
     AppendMenuW(m, MF_SEPARATOR, 0, nullptr);
     AppendMenuW(m, MF_STRING, IDM_REMOVE, g_i18n.T("menu_remove").c_str());
@@ -1445,6 +1462,19 @@ bool EnsureTrayIcon() {
     icon.uVersion = NOTIFYICON_VERSION_4;
     Shell_NotifyIconW(NIM_SETVERSION, &icon);
     return true;
+}
+
+void NotifyUser(const std::wstring& title, const std::wstring& detail, int sound, bool warning) {
+    if (g_exiting) return;
+    if (sound >= 0) MessageBeep((UINT)sound);
+    if (!EnsureTrayIcon()) return;
+    NOTIFYICONDATAW icon = {};
+    icon.cbSize = sizeof(icon); icon.hWnd = g_main; icon.uID = 1;
+    icon.uFlags = NIF_INFO;
+    icon.dwInfoFlags = (warning ? NIIF_WARNING : NIIF_INFO) | NIIF_NOSOUND;
+    wcsncpy_s(icon.szInfoTitle, title.c_str(), _TRUNCATE);
+    wcsncpy_s(icon.szInfo, detail.c_str(), _TRUNCATE);
+    Shell_NotifyIconW(NIM_MODIFY, &icon);
 }
 
 void RemoveTrayIcon() {
@@ -1574,7 +1604,7 @@ static LRESULT CALLBACK MainProc(HWND h, UINT m, WPARAM w, LPARAM l) {
         int id = LOWORD(w);
         int code = HIWORD(w);
         if (id >= IDM_TRAY_SHOW && id <= IDM_CLOSE_EXIT) { HandleTrayCommand(id); return 0; }
-        if (id >= IDM_PLAY && id <= IDM_DELETE_FILE) { ApplyListCommand(h, id, SelectedRecordings()); return 0; }
+        if (id >= IDM_PLAY && id <= IDM_COPY_FILES) { ApplyListCommand(h, id, SelectedRecordings()); return 0; }
         if (id == IDC_RECORD && (code == BN_CLICKED || code == 0)) {
             if (g_rec.Running()) StopRecording();
             else                 StartRecording();

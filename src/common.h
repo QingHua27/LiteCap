@@ -19,6 +19,7 @@ std::wstring ExeDir();
 std::wstring JoinPath(const std::wstring& dir, const std::wstring& name);
 bool         FileExists(const std::wstring& p);
 long long    FileSize(const std::wstring& p);
+bool         CopyVideoFiles(HWND owner, const std::vector<std::wstring>& paths);
 
 // ---------------- 格式化 ----------------
 std::wstring FormatDuration(long long ms);          // 00:00 / 01:23:45

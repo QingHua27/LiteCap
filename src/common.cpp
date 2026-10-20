@@ -1,6 +1,7 @@
 // common.cpp
 #include "common.h"
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -50,6 +51,63 @@ long long FileSize(const std::wstring& p) {
     WIN32_FILE_ATTRIBUTE_DATA fad = {};
     if (!GetFileAttributesExW(p.c_str(), GetFileExInfoStandard, &fad)) return 0;
     return ((long long)fad.nFileSizeHigh << 32) | fad.nFileSizeLow;
+}
+
+bool CopyVideoFiles(HWND owner, const std::vector<std::wstring>& paths) {
+    if (paths.empty()) return false;
+    std::wstring names;
+    for (const auto& path : paths) {
+        if (path.empty() || path.find(L'\0') != std::wstring::npos) return false;
+        DWORD length = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (!length) return false;
+        std::wstring absolute(length, L'\0');
+        DWORD written = GetFullPathNameW(path.c_str(), length, absolute.data(), nullptr);
+        if (!written || written >= length) return false;
+        absolute.resize(written);
+        if (!FileExists(absolute)) return false;
+        names += absolute;
+        names.push_back(L'\0');
+    }
+    names.push_back(L'\0');
+    HGLOBAL files = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                               sizeof(DROPFILES) + names.size() * sizeof(wchar_t));
+    HGLOBAL effect = GlobalAlloc(GMEM_MOVEABLE, sizeof(DWORD));
+    if (!files || !effect) {
+        if (files) GlobalFree(files);
+        if (effect) GlobalFree(effect);
+        return false;
+    }
+    auto drop = (DROPFILES*)GlobalLock(files);
+    auto operation = (DWORD*)GlobalLock(effect);
+    if (!drop || !operation) {
+        if (drop) GlobalUnlock(files);
+        if (operation) GlobalUnlock(effect);
+        GlobalFree(files); GlobalFree(effect);
+        return false;
+    }
+    drop->pFiles = sizeof(DROPFILES);
+    drop->fWide = TRUE;
+    memcpy((BYTE*)drop + sizeof(DROPFILES), names.data(), names.size() * sizeof(wchar_t));
+    *operation = DROPEFFECT_COPY;
+    GlobalUnlock(files); GlobalUnlock(effect);
+    const UINT effectFormat = RegisterClipboardFormatW(CFSTR_PREFERREDDROPEFFECT);
+    bool opened = false;
+    for (int attempt = 0; attempt < 5; ++attempt) {
+        if (OpenClipboard(owner)) { opened = true; break; }
+        if (attempt < 4) Sleep(10);
+    }
+    bool copied = false;
+    if (opened) {
+        if (EmptyClipboard() && SetClipboardData(CF_HDROP, files)) {
+            files = nullptr; // Clipboard now owns this memory, including after app exit.
+            copied = true;
+            if (effectFormat && SetClipboardData(effectFormat, effect)) effect = nullptr;
+        }
+        CloseClipboard();
+    }
+    if (files) GlobalFree(files);
+    if (effect) GlobalFree(effect);
+    return copied;
 }
 
 // ---------------- 格式化 ----------------

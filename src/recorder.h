@@ -50,7 +50,7 @@ public:
     bool WriteFrame(const BYTE* bgra, LONGLONG rtStart, LONGLONG rtDuration);
     bool WriteAudio(const int16_t* stereoPcm, DWORD frames,
                     LONGLONG rtStart, LONGLONG rtDuration);
-    void Close();
+    bool Close(); // True only when the MP4 was finalized successfully.
 
     // 这次实际用的是硬件编码器还是软件编码器（Open 成功之后才有意义）
     bool Hardware() const { return hardware_; }

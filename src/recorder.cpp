@@ -242,15 +242,17 @@ bool Mp4Encoder::WriteAudio(const int16_t* stereoPcm, DWORD frames,
     return SUCCEEDED(hr);
 }
 
-void Mp4Encoder::Close() {
-    if (!impl_) return;
+bool Mp4Encoder::Close() {
+    if (!impl_) return true;
+    bool finalized = false;
     if (impl_->writer) {
-        if (impl_->began) impl_->writer->Finalize();
+        if (impl_->began) finalized = SUCCEEDED(impl_->writer->Finalize());
         impl_->writer->Release();
         impl_->writer = nullptr;
     }
     delete impl_;
     impl_ = nullptr;
+    return finalized;
 }
 
 // ================= WASAPI 音频采集 =================
@@ -550,6 +552,9 @@ bool WriteAudioUntil(Mp4Encoder& encoder, AudioRing& sysRing, AudioRing& micRing
 bool Recorder::Start(HWND notify, const RecTarget& target, int fps, const std::string& quality,
                      const std::wstring& outPath, bool systemAudio, bool microphoneAudio) {
     if (running_.load()) return false;
+    // A worker can finish or fail on its own. Its std::thread still needs
+    // joining before it is replaced by the next recording.
+    if (thread_.joinable()) thread_.join();
 
     if (target.window) {
         if (!target.hwnd || !IsWindow(target.hwnd)) return false;
@@ -575,7 +580,6 @@ bool Recorder::Start(HWND notify, const RecTarget& target, int fps, const std::s
 }
 
 void Recorder::Stop() {
-    if (!running_.load()) return;
     stop_ = true;
     if (thread_.joinable()) thread_.join();
     running_ = false;
@@ -717,6 +721,7 @@ void Recorder::ThreadMain() {
     LONGLONG nextAudioSample = 0;
     std::vector<int16_t> audioMix;
     bool audioWriteFailed = false;
+    bool videoWriteFailed = false;
     const double frameInterval = 1.0 / fps_;
     auto nextDue = t0;
     auto lastTick = t0;
@@ -754,7 +759,10 @@ void Recorder::ThreadMain() {
         if (pts <= lastPts) pts = lastPts + 1;
         lastPts = pts;
 
-        enc.WriteFrame(px, pts, frameDur);
+        if (!enc.WriteFrame(px, pts, frameDur)) {
+            videoWriteFailed = true;
+            break;
+        }
         ++frames;
 
         if (audioEnabled) {
@@ -771,7 +779,7 @@ void Recorder::ThreadMain() {
             }
         }
 
-        if (std::chrono::duration<double>(clock::now() - lastTick).count() >= 0.25) {
+        if (frames == 1 || std::chrono::duration<double>(clock::now() - lastTick).count() >= 0.25) {
             lastTick = clock::now();
             ev = new RecEvent();
             ev->frames = frames;
@@ -794,14 +802,17 @@ void Recorder::ThreadMain() {
             audioWriteFailed = true;
     }
 
-    enc.Close();
+    const bool finalized = enc.Close();
     sc.Shutdown();
     wc.Shutdown();
     timeEndPeriod(1);
 
-    if (audioWriteFailed) {
+    if (audioWriteFailed || videoWriteFailed || !finalized || frames == 0) {
         RecEvent* error = new RecEvent();
-        error->error = L"audio sample write failed";
+        if (audioWriteFailed) error->error = L"audio sample write failed";
+        else if (videoWriteFailed) error->error = L"video sample write failed";
+        else if (!finalized) error->error = L"video finalization failed";
+        else error->error = L"no video frames captured";
         PostMessageW(notify_, WM_REC_FAIL, 0, (LPARAM)error);
         running_ = false;
         return;

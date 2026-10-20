@@ -31,7 +31,9 @@
 | 输出到 `D:\Recordings`                          | D 盘不存在时自动退回用户「视频」目录                     |
 | 录制记录列表                                       | 自动移除已删除的源文件；支持 Ctrl 多选、Shift 连选；可收起，存于 `history.tsv` |
 | **软件内播放**                                    | 双击列表项直接播放，支持播放/暂停、进度条拖拽、`Esc` 关闭        |
-| **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 批量复制路径 / 移除记录 / 删除文件 |
+| **右键菜单**                                     | 在软件中播放 · 打开所在目录 · 批量复制视频文件 / 复制路径 / 移除记录 / 删除文件 |
+| 录制完成自动复制                                   | 视频保存完成后放入剪贴板，可直接粘贴到文件夹或支持文件粘贴的聊天软件 |
+| 录制状态反馈                                       | 开始和结束时提供提示音与托盘通知，不切换前台窗口 |
 | 悬浮窗模式                                        | 圆角置顶小条，随时开始/停止，实时计时，位置记忆                |
 | 自定义全局快捷键                                  | 支持 F8、字母、数字等单键及组合键，按一次开始、再按一次停止；兼容部分全屏游戏的热键消息缺失；Esc 取消设置，Backspace / Delete 清除 |
 | 系统托盘                                          | 默认关闭时收进托盘；右键可退出或设置关闭动作，录制中收进托盘会继续录制 |
@@ -50,7 +52,9 @@
 
 ### 录制记录与托盘
 
-源文件被删除后，记录会在启动、切回主窗口或约两秒内自动移除，并保存清理结果。Ctrl 单击可选择不相邻的记录，Shift 单击可连续选择；右键选中项可以批量复制完整路径、移除记录或删除文件。删除文件会统一确认，无法删除的文件仍保留在列表中；播放和打开目录用于单选。
+源文件被删除后，记录会在启动、切回主窗口或约两秒内自动移除，并保存清理结果。Ctrl 单击可选择不相邻的记录，Shift 单击可连续选择；右键选中项可以批量复制视频文件、复制完整路径、移除记录或删除文件。复制视频文件后可直接粘贴到文件夹或支持文件粘贴的聊天软件，源文件保留。删除文件会统一确认，无法删除的文件仍保留在列表中；播放和打开目录用于单选。
+
+录制成功结束后自动复制新视频，无需回到列表操作。开始录制和视频保存完成时会播放提示音并显示托盘通知，不抢占游戏焦点；通知显示和声音受 Windows 通知及声音设置影响。复制失败会提示视频已保存，可在列表中重试。编码或封装失败时保留原有剪贴板内容。
 
 默认点击主窗口关闭按钮会收进托盘，录像继续进行。单击托盘图标可恢复主窗口；右键 → **关闭动作** 可以选择“最小化到托盘”或“直接退出”，设置会保存。右键 → **退出** 始终结束程序，并完成、保存正在录制的文件及记录。
 
@@ -250,11 +254,15 @@ cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /I src _test\hotkey_gate_test.cpp /Fo
 build\hotkey_gate_test.exe
 cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\common.cpp src\recorder.cpp src\history.cpp src\player.cpp src\wincap.cpp _test\fullscreen_hotkey_test.cpp build\app.res /Fo:build\ /Fe:build\fullscreen_hotkey_test.exe /link mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib shlwapi.lib shell32.lib winmm.lib dwmapi.lib
 python _test\run_fullscreen_hotkey_test.py build\fullscreen_hotkey_test.exe
+cl /nologo /EHsc /std:c++20 /MT /O2 /utf-8 /DUNICODE /D_UNICODE /I src src\common.cpp _test\failing_sink_writer.cpp src\history.cpp src\player.cpp src\wincap.cpp _test\recording_clipboard_test.cpp build\app.res /Fo:build\ /Fe:build\recording_clipboard_test.exe /link mfplay.lib mfplat.lib mfreadwrite.lib mfuuid.lib ole32.lib oleaut32.lib user32.lib gdi32.lib comctl32.lib shlwapi.lib shell32.lib winmm.lib dwmapi.lib
+python _test\run_recording_clipboard_test.py build\recording_clipboard_test.exe
 ```
 
 全屏测试覆盖关联渲染窗口切换、退出全屏、调整尺寸和固定输出画布；框选测试覆盖背景可见性、选区亮度、坐标、取消及 GDI 资源清理。框选测试会短暂显示测试背景。
 
 热键回归在独立配置中屏蔽系统热键消息，验证备用检测仍可开始、保持和停止录制。英雄联盟对局请在进入游戏后选择 `League of Legends.exe` 对局窗口；`LeagueClientUx.exe` 是大厅客户端。
+
+剪贴板回归使用真实录制和文件剪贴板，覆盖中文多选、复制路径兼容、录制完成及退出后仍可粘贴、提示次数和失败恢复；仅在测试中注入写入/封装错误，并拦截提示音和通知请求以免干扰桌面。
 
 `_probe/fps_probe.cpp` 编译后可直接读 MP4：
 
